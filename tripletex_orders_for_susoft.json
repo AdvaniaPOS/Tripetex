@@ -1,0 +1,124 @@
+{
+  "source": "Tripletex API v2 test",
+  "exportedAtOslo": "2026-06-19T13:03:06.435474+02:00",
+  "filters": {
+    "isSent": true,
+    "isInvoiced": false
+  },
+  "data": {
+    "fullResultSize": 3,
+    "from": 0,
+    "count": 3,
+    "versionDigest": "'If-None-Match' header not specified",
+    "values": [
+      {
+        "id": 210270190,
+        "customer": {
+          "id": 93615342,
+          "name": "Jon Sigurdarson"
+        },
+        "number": "1",
+        "orderDate": "2026-06-19",
+        "orderLines": [
+          {
+            "id": 973684743,
+            "product": {
+              "id": 69775678,
+              "name": "Susoft aPOS 16\"",
+              "number": "10001"
+            },
+            "description": "16\" aPOS med touch",
+            "count": 2.0,
+            "unitPriceExcludingVatCurrency": 6990.0,
+            "currency": {
+              "id": 1
+            },
+            "markup": 0.0,
+            "discount": 25.0,
+            "vatType": {
+              "id": 3,
+              "name": "Utgående avgift, høy sats",
+              "number": "3",
+              "percentage": 25
+            },
+            "amountExcludingVatCurrency": 10485.0,
+            "amountIncludingVatCurrency": 13106.25,
+            "unitPriceIncludingVatCurrency": 8737.5
+          }
+        ]
+      },
+      {
+        "id": 210270191,
+        "customer": {
+          "id": 93615342,
+          "name": "Jon Sigurdarson"
+        },
+        "number": "2",
+        "orderDate": "2026-06-19",
+        "orderLines": [
+          {
+            "id": 973684744,
+            "product": {
+              "id": 69775678,
+              "name": "Susoft aPOS 16\"",
+              "number": "10001"
+            },
+            "description": "16\" aPOS med touch",
+            "count": 1.0,
+            "unitPriceExcludingVatCurrency": 6990.0,
+            "currency": {
+              "id": 1
+            },
+            "markup": 0.0,
+            "discount": 0.0,
+            "vatType": {
+              "id": 3,
+              "name": "Utgående avgift, høy sats",
+              "number": "3",
+              "percentage": 25
+            },
+            "amountExcludingVatCurrency": 6990.0,
+            "amountIncludingVatCurrency": 8737.5,
+            "unitPriceIncludingVatCurrency": 8737.5
+          }
+        ]
+      },
+      {
+        "id": 210270345,
+        "customer": {
+          "id": 93615342,
+          "name": "Jon Sigurdarson"
+        },
+        "number": "3",
+        "orderDate": "2026-06-19",
+        "orderLines": [
+          {
+            "id": 973685266,
+            "product": {
+              "id": 69775678,
+              "name": "Susoft aPOS 16\"",
+              "number": "10001"
+            },
+            "description": "16\" aPOS med touch",
+            "count": 1.0,
+            "unitPriceExcludingVatCurrency": 6990.0,
+            "currency": {
+              "id": 1
+            },
+            "markup": 0.0,
+            "discount": 0.0,
+            "vatType": {
+              "id": 3,
+              "name": "Utgående avgift, høy sats",
+              "number": "3",
+              "percentage": 25
+            },
+            "amountExcludingVatCurrency": 6990.0,
+            "amountIncludingVatCurrency": 8737.5,
+            "unitPriceIncludingVatCurrency": 8737.5
+          }
+        ]
+      }
+    ]
+  }
+}
