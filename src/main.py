@@ -1217,6 +1217,18 @@ def dashboard_home() -> str:
             <div class="panel">
                 <h3>Tenant Setup</h3>
                 <div class="section-grid" style="grid-template-columns: repeat(4, minmax(0, 1fr)); align-items: end;">
+                    <div style="grid-column: span 2;">
+                        <div class="toolbar-label">Rediger Eksisterende Tenant</div>
+                        <select id="cfgExistingTenantSelect">
+                            <option value="">-- Ny tenant --</option>
+                        </select>
+                    </div>
+                    <div>
+                        <button id="cfgLoadExistingTenant" class="secondary" type="button">Load Into Form</button>
+                    </div>
+                    <div>
+                        <button id="cfgClearExistingTenant" class="secondary" type="button">Clear Edit Mode</button>
+                    </div>
                     <div>
                         <div class="toolbar-label">Tenant Key</div>
                         <input id="cfgTenantKey" type="text" placeholder="butikk-1" />
@@ -1434,6 +1446,7 @@ def dashboard_home() -> str:
         const limitEl = document.getElementById('limit');
         const cfgTenantKeyEl = document.getElementById('cfgTenantKey');
         const cfgTenantNameEl = document.getElementById('cfgTenantName');
+        const cfgExistingTenantSelectEl = document.getElementById('cfgExistingTenantSelect');
         const cfgTripletexBaseUrlEl = document.getElementById('cfgTripletexBaseUrl');
         const cfgSusoftBaseUrlEl = document.getElementById('cfgSusoftBaseUrl');
         const cfgTripletexConsumerTokenEl = document.getElementById('cfgTripletexConsumerToken');
@@ -1563,6 +1576,20 @@ def dashboard_home() -> str:
             });
         }
 
+        function syncExistingTenantSelect(tenants) {
+            const currentValue = String(cfgExistingTenantSelectEl.value || '');
+            cfgExistingTenantSelectEl.innerHTML = '<option value="">-- Ny tenant --</option>';
+            tenants.forEach((tenant) => {
+                const option = document.createElement('option');
+                option.value = tenant.tenant_key;
+                option.textContent = tenant.tenant_key + ' (' + (tenant.name || '-') + ')';
+                cfgExistingTenantSelectEl.appendChild(option);
+            });
+            if (currentValue && tenants.some((tenant) => tenant.tenant_key === currentValue)) {
+                cfgExistingTenantSelectEl.value = currentValue;
+            }
+        }
+
         function setMenu(activeMenuId) {
             ['menuAddTenant', 'menuAllTenants', 'menuSupport'].forEach((id) => {
                 document.getElementById(id).classList.toggle('active', id === activeMenuId);
@@ -1612,6 +1639,7 @@ def dashboard_home() -> str:
                 tenantEl.value = current;
             }
             renderTenantListRows(tenants);
+            syncExistingTenantSelect(tenants);
             return tenants;
         }
 
@@ -1623,6 +1651,7 @@ def dashboard_home() -> str:
             }
             try {
                 const info = await api('/api/tenants/' + encodeURIComponent(tenant) + '/connections');
+                cfgExistingTenantSelectEl.value = info.tenant_key || '';
                 cfgTenantKeyEl.value = info.tenant_key || tenant;
                 cfgTenantNameEl.value = info.name || '';
                 cfgTripletexBaseUrlEl.value = info.tripletex_base_url || '';
@@ -1654,10 +1683,18 @@ def dashboard_home() -> str:
 
         async function saveTenantConfig() {
             const saveBtn = document.getElementById('saveTenantConfig');
+            const editingTenantKey = String(cfgExistingTenantSelectEl.value || '').trim();
             const tenantKey = String(cfgTenantKeyEl.value || '').trim();
             const tenantName = String(cfgTenantNameEl.value || '').trim();
             if (!tenantKey || !tenantName) {
                 const message = 'Feil: tenant key og name er påkrevd';
+                cfgSaveMessageEl.textContent = message;
+                cfgStatusEl.textContent = message;
+                logEl.textContent = message;
+                return;
+            }
+            if (editingTenantKey && tenantKey !== editingTenantKey) {
+                const message = 'Feil: Du er i edit-modus for ' + editingTenantKey + '. Hold tenant key lik eller velg Clear Edit Mode.';
                 cfgSaveMessageEl.textContent = message;
                 cfgStatusEl.textContent = message;
                 logEl.textContent = message;
@@ -1916,6 +1953,37 @@ def dashboard_home() -> str:
         });
 
         document.getElementById('saveTenantConfig').addEventListener('click', saveTenantConfig);
+        document.getElementById('cfgLoadExistingTenant').addEventListener('click', async () => {
+            const selected = String(cfgExistingTenantSelectEl.value || '').trim();
+            if (!selected) {
+                cfgSaveMessageEl.textContent = 'Velg tenant i listen for a laste den inn.';
+                return;
+            }
+            tenantEl.value = selected;
+            await loadTenantConnections();
+            cfgSaveMessageEl.textContent = 'Edit mode: ' + selected;
+            cfgStatusEl.textContent = 'Tenant lastet for redigering.';
+        });
+        document.getElementById('cfgClearExistingTenant').addEventListener('click', () => {
+            cfgExistingTenantSelectEl.value = '';
+            cfgTenantKeyEl.value = '';
+            cfgTenantNameEl.value = '';
+            cfgTripletexBaseUrlEl.value = '';
+            cfgSusoftBaseUrlEl.value = '';
+            cfgTripletexConsumerTokenEl.value = '';
+            cfgTripletexEmployeeTokenEl.value = '';
+            cfgSusoftShopUrlKeyEl.value = '';
+            cfgSusoftUsernameEl.value = '';
+            cfgSusoftPasswordEl.value = '';
+            cfgAutoPaidSyncEnabledEl.value = 'true';
+            cfgAutoPaidSyncIntervalMinutesEl.value = '1';
+            cfgDailyDirectSalesSyncEnabledEl.value = 'false';
+            cfgDailyDirectSalesSyncTimeEl.value = '23:00';
+            cfgDirectSalesDefaultIncomeAccountEl.value = '';
+            cfgDirectSalesSettlementOffsetAccountEl.value = '1900';
+            cfgSaveMessageEl.textContent = 'Edit mode ryddet. Klar for ny tenant.';
+            cfgStatusEl.textContent = 'Ny tenant-modus.';
+        });
         document.getElementById('menuAddTenant').addEventListener('click', () => setMenu('menuAddTenant'));
         document.getElementById('menuAllTenants').addEventListener('click', () => setMenu('menuAllTenants'));
         document.getElementById('menuSupport').addEventListener('click', () => setMenu('menuSupport'));
