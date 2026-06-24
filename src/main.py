@@ -98,12 +98,26 @@ def _resolve_susoft_webhook_tenant_key(incoming_tenant_key: str | None) -> str:
     return _resolve_tripletex_webhook_tenant_key(incoming_tenant_key)
 
 
-def _is_valid_webhook_secret(*, provided_header: str | None = None, provided_token: str | None = None) -> bool:
+def _is_valid_webhook_secret(
+    *,
+    provided_header: str | None = None,
+    provided_token: str | None = None,
+    provided_auth_header: str | None = None,
+    provided_alt_header: str | None = None,
+) -> bool:
     expected_secret = settings.webhook_shared_secret.strip()
     if not expected_secret:
         return True
     if provided_header and secrets.compare_digest(str(provided_header), expected_secret):
         return True
+    if provided_alt_header and secrets.compare_digest(str(provided_alt_header), expected_secret):
+        return True
+    if provided_auth_header:
+        auth_value = str(provided_auth_header).strip()
+        if auth_value.lower().startswith("bearer "):
+            auth_value = auth_value[7:].strip()
+        if auth_value and secrets.compare_digest(auth_value, expected_secret):
+            return True
     if provided_token and secrets.compare_digest(str(provided_token), expected_secret):
         return True
     return False
@@ -122,6 +136,22 @@ def _extract_susoft_uuid_from_payload(payload: dict[str, object]) -> str:
                 return nested_uuid.strip()
 
     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="susoft_uuid mangler")
+
+
+def _extract_tripletex_order_id_from_susoft_payload(payload: dict[str, object]) -> str | None:
+    for key in ("alternativeId", "externalRef", "tripletex_order_id", "tripletexOrderId", "order_id", "orderId"):
+        raw = payload.get(key)
+        if raw is not None and str(raw).strip():
+            return str(raw).strip()
+
+    for container_key in ("entity", "order", "value", "data"):
+        container = payload.get(container_key)
+        if isinstance(container, dict):
+            for key in ("alternativeId", "externalRef", "tripletex_order_id", "tripletexOrderId", "order_id", "orderId"):
+                raw = container.get(key)
+                if raw is not None and str(raw).strip():
+                    return str(raw).strip()
+    return None
 
 
 @app.on_event("startup")
@@ -246,16 +276,45 @@ def webhook_susoft_payment(
     tenant_key: str | None = Query(default=None),
     token: str | None = Query(default=None),
     x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
+    x_webhook_token: str | None = Header(default=None, alias="X-Webhook-Token"),
+    authorization: str | None = Header(default=None, alias="Authorization"),
 ) -> dict[str, object]:
     payload_token_value = payload.get("token") if isinstance(payload.get("token"), str) else None
-    if not _is_valid_webhook_secret(provided_header=x_webhook_secret, provided_token=token or payload_token_value):
+    if not _is_valid_webhook_secret(
+        provided_header=x_webhook_secret,
+        provided_alt_header=x_webhook_token,
+        provided_auth_header=authorization,
+        provided_token=token or payload_token_value,
+    ):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid webhook secret")
 
     tenant_key_value = _resolve_susoft_webhook_tenant_key(
         tenant_key
         or str(payload.get("tenant_key") or payload.get("tenantKey") or "").strip()
     )
-    susoft_uuid = _extract_susoft_uuid_from_payload(payload)
+    tripletex_order_id = _extract_tripletex_order_id_from_susoft_payload(payload)
+
+    susoft_uuid: str | None = None
+    try:
+        susoft_uuid = _extract_susoft_uuid_from_payload(payload)
+    except HTTPException:
+        susoft_uuid = None
+
+    if not susoft_uuid and tripletex_order_id:
+        with db_session() as session:
+            tenant = session.scalar(select(Tenant).where(Tenant.tenant_key == tenant_key_value))
+            if tenant is not None:
+                row = session.scalar(
+                    select(OrderSync).where(
+                        OrderSync.tenant_id == tenant.id,
+                        OrderSync.tripletex_order_id == tripletex_order_id,
+                    )
+                )
+                if row is not None and row.susoft_uuid:
+                    susoft_uuid = row.susoft_uuid
+
+    if not susoft_uuid:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="susoft_uuid mangler")
 
     raw_payment_type_id = payload.get("payment_type_id") or payload.get("paymentTypeId") or 20756819
     try:
