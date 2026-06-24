@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import secrets
 from datetime import UTC, datetime
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.responses import HTMLResponse
@@ -50,6 +51,29 @@ def _keep_or_replace_secret(current: str | None, incoming: str | None) -> str | 
         return current
     value = incoming.strip()
     return current if not value else value
+
+
+def _append_tenant_key_to_target_url(target_url: str, tenant_key: str) -> str:
+    parts = urlsplit(target_url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    if not query.get("tenant_key"):
+        query["tenant_key"] = tenant_key
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+def _resolve_tripletex_webhook_tenant_key(incoming_tenant_key: str | None) -> str:
+    if incoming_tenant_key and incoming_tenant_key.strip():
+        return incoming_tenant_key.strip()
+
+    with db_session() as session:
+        active_tenants = session.scalars(select(Tenant).where(Tenant.active.is_(True)).order_by(Tenant.id.asc())).all()
+
+    if len(active_tenants) == 1:
+        return active_tenants[0].tenant_key
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="tenant_key mangler. Sett tenant_key i callback-url query eller payload.",
+    )
 
 
 @app.on_event("startup")
@@ -135,12 +159,22 @@ def api_sync_paid_from_susoft(
 
 
 @app.post("/webhooks/tripletex/order", dependencies=[Depends(_require_webhook_secret)])
-def webhook_tripletex_order(payload: dict[str, object]) -> dict[str, object]:
-    tenant_key = str(payload.get("tenant_key") or payload.get("tenantKey") or "").strip()
-    if not tenant_key:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="tenant_key mangler")
+def webhook_tripletex_order(payload: dict[str, object], tenant_key: str | None = Query(default=None)) -> dict[str, object]:
+    tenant_key_value = _resolve_tripletex_webhook_tenant_key(
+        tenant_key
+        or str(payload.get("tenant_key") or payload.get("tenantKey") or "").strip()
+    )
 
-    raw_order_id = payload.get("order_id") or payload.get("orderId") or payload.get("tripletex_order_id") or payload.get("tripletexOrderId")
+    # Tripletex webhook format uses id/event/value, while manual test payloads may use order_id.
+    raw_order_id = (
+        payload.get("order_id")
+        or payload.get("orderId")
+        or payload.get("tripletex_order_id")
+        or payload.get("tripletexOrderId")
+        or payload.get("id")
+    )
+    if raw_order_id is None and isinstance(payload.get("value"), dict):
+        raw_order_id = payload["value"].get("id")
     if raw_order_id is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="order_id mangler")
 
@@ -151,7 +185,7 @@ def webhook_tripletex_order(payload: dict[str, object]) -> dict[str, object]:
 
     dry_run = bool(payload.get("dry_run") or payload.get("dryRun") or False)
     try:
-        return process_tripletex_order_by_id_for_tenant(tenant_key, order_id, dry_run=dry_run)
+        return process_tripletex_order_by_id_for_tenant(tenant_key_value, order_id, dry_run=dry_run)
     except RuntimeError as exc:
         detail = str(exc)
         status_code = status.HTTP_404_NOT_FOUND if "Fant ikke" in detail or "finnes ikke" in detail else status.HTTP_400_BAD_REQUEST
@@ -220,12 +254,13 @@ def api_tripletex_create_order_webhook(tenant_key: str, target_url: str) -> dict
 
     overrides = _tripletex_overrides_from_tenant(tenant)
     token = create_session_token(overrides=overrides)
+    target_url_with_tenant = _append_tenant_key_to_target_url(target_url, tenant_key)
     try:
         # Keep subscription payload minimal. Some Tripletex setups reject complex fields filters for events.
         result = create_event_subscription(
             token,
             event="order.create",
-            target_url=target_url,
+            target_url=target_url_with_tenant,
             overrides=overrides,
             auth_header_name="X-Webhook-Secret" if settings.webhook_shared_secret.strip() else None,
             auth_header_value=settings.webhook_shared_secret.strip() or None,
