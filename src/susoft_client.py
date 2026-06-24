@@ -176,7 +176,13 @@ def find_cart_by_external_id(
     params = {"extId": ext_id}
 
     try:
-        response = requests.get(url, headers=headers, params=params, timeout=int(resolved["timeout"]))
+        response = _request_with_rate_limit_retry(
+            "GET",
+            url,
+            timeout=int(resolved["timeout"]),
+            headers=headers,
+            params=params,
+        )
     except requests.RequestException as exc:
         raise RuntimeError(f"Nettverksfeil ved lesing av Susoft shopping-cart per externalRef: {exc}") from exc
 
@@ -206,7 +212,13 @@ def find_cart_by_uuid(
     params = {"uuid": uuid}
 
     try:
-        response = requests.get(url, headers=headers, params=params, timeout=int(resolved["timeout"]))
+        response = _request_with_rate_limit_retry(
+            "GET",
+            url,
+            timeout=int(resolved["timeout"]),
+            headers=headers,
+            params=params,
+        )
     except requests.RequestException as exc:
         raise RuntimeError(f"Nettverksfeil ved lesing av Susoft shopping-cart per uuid: {exc}") from exc
 
@@ -236,7 +248,13 @@ def find_order_by_uuid(
     params = {"uuid": uuid}
 
     try:
-        response = requests.get(url, headers=headers, params=params, timeout=int(resolved["timeout"]))
+        response = _request_with_rate_limit_retry(
+            "GET",
+            url,
+            timeout=int(resolved["timeout"]),
+            headers=headers,
+            params=params,
+        )
     except requests.RequestException as exc:
         raise RuntimeError(f"Nettverksfeil ved lesing av Susoft order per uuid: {exc}") from exc
 
