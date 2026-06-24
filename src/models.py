@@ -24,6 +24,8 @@ class Tenant(Base):
     susoft_shop_url_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     susoft_username: Mapped[str | None] = mapped_column(String(255), nullable=True)
     susoft_password: Mapped[str | None] = mapped_column(Text, nullable=True)
+    auto_paid_sync_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    auto_paid_sync_interval_minutes: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
 

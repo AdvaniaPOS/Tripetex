@@ -31,6 +31,8 @@ def _ensure_schema_compatibility() -> None:
         "susoft_shop_url_key": "VARCHAR(255)",
         "susoft_username": "VARCHAR(255)",
         "susoft_password": "TEXT",
+        "auto_paid_sync_enabled": "BOOLEAN DEFAULT TRUE",
+        "auto_paid_sync_interval_minutes": "INTEGER DEFAULT 1",
     }
 
     with engine.begin() as conn:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import secrets
+import threading
+import time
 from datetime import UTC, datetime
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -28,6 +30,9 @@ from src.tripletex_client import create_event_subscription, create_session_token
 
 settings = get_settings()
 app = FastAPI(title=settings.app_name)
+AUTO_PAID_SYNC_MIN_INTERVAL_MINUTES = 1
+AUTO_PAID_SYNC_MAX_INTERVAL_MINUTES = 1440
+AUTO_PAID_SYNC_TICK_SECONDS = 5
 
 
 def _require_webhook_secret(x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret")) -> None:
@@ -67,6 +72,70 @@ def _keep_or_replace_secret(current: str | None, incoming: str | None) -> str | 
         return current
     value = incoming.strip()
     return current if not value else value
+
+
+def _to_bool(value: object, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _clamp_auto_paid_sync_interval_minutes(raw_value: object, *, default: int = 1) -> int:
+    try:
+        value = int(str(raw_value))
+    except Exception:
+        value = default
+    return max(AUTO_PAID_SYNC_MIN_INTERVAL_MINUTES, min(AUTO_PAID_SYNC_MAX_INTERVAL_MINUTES, value))
+
+
+def _run_auto_paid_sync_worker(stop_event: threading.Event) -> None:
+    next_run_by_tenant: dict[str, float] = {}
+    while not stop_event.wait(AUTO_PAID_SYNC_TICK_SECONDS):
+        try:
+            with db_session() as session:
+                tenants = session.scalars(
+                    select(Tenant)
+                    .where(
+                        Tenant.active.is_(True),
+                        Tenant.auto_paid_sync_enabled.is_(True),
+                    )
+                    .order_by(Tenant.id.asc())
+                ).all()
+        except Exception:
+            continue
+
+        now = time.monotonic()
+        active_keys = {tenant.tenant_key for tenant in tenants}
+        for key in list(next_run_by_tenant.keys()):
+            if key not in active_keys:
+                next_run_by_tenant.pop(key, None)
+
+        for tenant in tenants:
+            if not (tenant.susoft_shop_url_key and tenant.susoft_username and tenant.susoft_password):
+                continue
+
+            interval_minutes = _clamp_auto_paid_sync_interval_minutes(tenant.auto_paid_sync_interval_minutes, default=1)
+            next_due = next_run_by_tenant.get(tenant.tenant_key, 0.0)
+            if now < next_due:
+                continue
+
+            next_run_by_tenant[tenant.tenant_key] = now + float(interval_minutes * 60)
+            try:
+                sync_paid_orders_to_tripletex_for_tenant(
+                    tenant.tenant_key,
+                    limit=settings.sync_default_limit,
+                    payment_type_id=20756819,
+                )
+            except Exception:
+                # Keep the scheduler resilient; operational details are captured as sync events.
+                continue
 
 
 def _append_tenant_key_to_target_url(target_url: str, tenant_key: str) -> str:
@@ -162,6 +231,22 @@ def on_startup() -> None:
             init_db()
         except Exception as exc:
             app.state.startup_error = f"database init failed: {exc}"
+
+    stop_event = threading.Event()
+    worker = threading.Thread(target=_run_auto_paid_sync_worker, args=(stop_event,), daemon=True, name="auto-paid-sync-worker")
+    app.state.auto_paid_sync_stop_event = stop_event
+    app.state.auto_paid_sync_worker = worker
+    worker.start()
+
+
+@app.on_event("shutdown")
+def on_shutdown() -> None:
+    stop_event = getattr(app.state, "auto_paid_sync_stop_event", None)
+    worker = getattr(app.state, "auto_paid_sync_worker", None)
+    if isinstance(stop_event, threading.Event):
+        stop_event.set()
+    if isinstance(worker, threading.Thread) and worker.is_alive():
+        worker.join(timeout=3)
 
 
 @app.get("/health")
@@ -462,6 +547,14 @@ def api_upsert_tenant(payload: dict[str, object]) -> dict[str, object]:
             row.susoft_password,
             payload.get("susoft_password") if "susoft_password" in payload else payload.get("susoftPassword"),
         )
+        row.auto_paid_sync_enabled = _to_bool(
+            payload.get("auto_paid_sync_enabled") if "auto_paid_sync_enabled" in payload else payload.get("autoPaidSyncEnabled"),
+            default=row.auto_paid_sync_enabled if row.auto_paid_sync_enabled is not None else True,
+        )
+        row.auto_paid_sync_interval_minutes = _clamp_auto_paid_sync_interval_minutes(
+            payload.get("auto_paid_sync_interval_minutes") if "auto_paid_sync_interval_minutes" in payload else payload.get("autoPaidSyncIntervalMinutes"),
+            default=row.auto_paid_sync_interval_minutes if row.auto_paid_sync_interval_minutes is not None else 1,
+        )
 
         session.commit()
         session.refresh(row)
@@ -471,6 +564,8 @@ def api_upsert_tenant(payload: dict[str, object]) -> dict[str, object]:
         "tenant_key": row.tenant_key,
         "name": row.name,
         "active": row.active,
+        "auto_paid_sync_enabled": row.auto_paid_sync_enabled,
+        "auto_paid_sync_interval_minutes": row.auto_paid_sync_interval_minutes,
         "has_tripletex_tokens": bool(row.tripletex_consumer_token and row.tripletex_employee_token),
         "has_susoft_credentials": bool(row.susoft_shop_url_key and row.susoft_username and row.susoft_password),
     }
@@ -487,6 +582,8 @@ def api_tenant_connections(tenant_key: str) -> dict[str, object]:
         "tenant_key": row.tenant_key,
         "name": row.name,
         "active": row.active,
+        "auto_paid_sync_enabled": row.auto_paid_sync_enabled,
+        "auto_paid_sync_interval_minutes": row.auto_paid_sync_interval_minutes,
         "tripletex_base_url": row.tripletex_base_url or settings.tripletex_base_url,
         "susoft_base_url": row.susoft_base_url or settings.susoft_base_url,
         "has_tripletex_tokens": bool(row.tripletex_consumer_token and row.tripletex_employee_token),
@@ -514,6 +611,8 @@ def api_tenants() -> list[dict[str, object]]:
             "tenant_key": row.tenant_key,
             "name": row.name,
             "active": row.active,
+            "auto_paid_sync_enabled": row.auto_paid_sync_enabled,
+            "auto_paid_sync_interval_minutes": row.auto_paid_sync_interval_minutes,
             "has_tripletex_tokens": bool(row.tripletex_consumer_token and row.tripletex_employee_token),
             "has_susoft_credentials": bool(row.susoft_shop_url_key and row.susoft_username and row.susoft_password),
             "created_at": row.created_at.isoformat(),
@@ -899,6 +998,17 @@ def dashboard_home() -> str:
                         <input id="cfgSusoftPassword" type="password" placeholder="Passord (tom = behold eksisterende)" />
                     </div>
                     <div>
+                        <div class="toolbar-label">Auto Betalingspolling</div>
+                        <select id="cfgAutoPaidSyncEnabled">
+                            <option value="true">Aktiv</option>
+                            <option value="false">Inaktiv</option>
+                        </select>
+                    </div>
+                    <div>
+                        <div class="toolbar-label">Polling Intervall (min)</div>
+                        <input id="cfgAutoPaidSyncIntervalMinutes" type="number" min="1" max="1440" value="1" />
+                    </div>
+                    <div>
                         <div class="toolbar-label">Connection Status</div>
                         <div id="cfgStatus" class="muted">Velg eller opprett tenant.</div>
                     </div>
@@ -1056,6 +1166,8 @@ def dashboard_home() -> str:
         const cfgSusoftShopUrlKeyEl = document.getElementById('cfgSusoftShopUrlKey');
         const cfgSusoftUsernameEl = document.getElementById('cfgSusoftUsername');
         const cfgSusoftPasswordEl = document.getElementById('cfgSusoftPassword');
+        const cfgAutoPaidSyncEnabledEl = document.getElementById('cfgAutoPaidSyncEnabled');
+        const cfgAutoPaidSyncIntervalMinutesEl = document.getElementById('cfgAutoPaidSyncIntervalMinutes');
         const cfgStatusEl = document.getElementById('cfgStatus');
         const cfgSaveMessageEl = document.getElementById('cfgSaveMessage');
         const tenantListRowsEl = document.getElementById('tenantListRows');
@@ -1241,9 +1353,14 @@ def dashboard_home() -> str:
                 cfgSusoftShopUrlKeyEl.value = '';
                 cfgSusoftUsernameEl.value = '';
                 cfgSusoftPasswordEl.value = '';
+                cfgAutoPaidSyncEnabledEl.value = String(info.auto_paid_sync_enabled !== false);
+                cfgAutoPaidSyncIntervalMinutesEl.value = String(info.auto_paid_sync_interval_minutes || 1);
                 const tt = info.has_tripletex_tokens ? 'TT OK' : 'TT mangler';
                 const ss = info.has_susoft_credentials ? 'Susoft OK' : 'Susoft mangler';
-                cfgStatusEl.innerHTML = statusTag(info.active ? 'ACTIVE' : 'INACTIVE') + ' ' + tt + ' / ' + ss;
+                const autoPolling = (info.auto_paid_sync_enabled !== false)
+                    ? ('Auto paid sync: hver ' + String(info.auto_paid_sync_interval_minutes || 1) + ' min')
+                    : 'Auto paid sync: av';
+                cfgStatusEl.innerHTML = statusTag(info.active ? 'ACTIVE' : 'INACTIVE') + ' ' + tt + ' / ' + ss + ' / ' + autoPolling;
             } catch (err) {
                 cfgStatusEl.textContent = 'Kunne ikke lese tenant-tilkobling: ' + String(err);
             }
@@ -1272,6 +1389,8 @@ def dashboard_home() -> str:
                 susoft_shop_url_key: String(cfgSusoftShopUrlKeyEl.value || '').trim(),
                 susoft_username: String(cfgSusoftUsernameEl.value || '').trim(),
                 susoft_password: String(cfgSusoftPasswordEl.value || '').trim(),
+                auto_paid_sync_enabled: String(cfgAutoPaidSyncEnabledEl.value || 'true') === 'true',
+                auto_paid_sync_interval_minutes: Number(cfgAutoPaidSyncIntervalMinutesEl.value || 1),
             };
 
             try {
