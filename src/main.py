@@ -925,9 +925,24 @@ def dashboard_home() -> str:
                     '<td>' + statusTag(tenant.active ? 'ACTIVE' : 'INACTIVE') + '</td>' +
                     '<td>' + statusTag(tenant.has_tripletex_tokens ? 'OK' : 'MISSING') + '</td>' +
                     '<td>' + statusTag(tenant.has_susoft_credentials ? 'OK' : 'MISSING') + '</td>' +
-                    '<td><button class="secondary" type="button" onclick="selectTenantFromList(\'' + tenant.tenant_key + '\')">Velg</button></td>' +
+                    '<td><button class="secondary tenant-select-btn" type="button" data-tenant-key="' + encodeURIComponent(tenant.tenant_key) + '">Velg</button></td>' +
                 '</tr>';
             }).join('') || '<tr><td colspan="6" class="muted">Ingen tenants funnet.</td></tr>';
+            bindTenantSelectButtons();
+        }
+
+        function bindTenantSelectButtons() {
+            document.querySelectorAll('.tenant-select-btn').forEach((button) => {
+                button.addEventListener('click', async () => {
+                    const tenantKey = decodeURIComponent(button.getAttribute('data-tenant-key') || '');
+                    if (!tenantKey) return;
+                    tenantEl.value = tenantKey;
+                    await loadTenantConnections();
+                    await loadWebhooks();
+                    await loadTenantData();
+                    setMenu('menuSupport');
+                });
+            });
         }
 
         function setMenu(activeMenuId) {
@@ -945,16 +960,12 @@ def dashboard_home() -> str:
             document.getElementById(panelByMenu[activeMenuId]).classList.add('active');
         }
 
-        window.selectTenantFromList = async function(tenantKey) {
-            tenantEl.value = tenantKey;
-            await loadTenantConnections();
-            await loadWebhooks();
-            await loadTenantData();
-            setMenu('menuSupport');
-        };
+        function appUrl(path) {
+            return new URL(path, window.location.origin).toString();
+        }
 
         async function api(url, opts) {
-            const r = await fetch(url, opts || {});
+            const r = await fetch(appUrl(url), opts || {});
             if (!r.ok) {
                 const t = await r.text();
                 throw new Error(r.status + ': ' + t);
@@ -1049,12 +1060,17 @@ def dashboard_home() -> str:
                 });
 
                 cfgSaveMessageEl.textContent = 'Lagret: ' + result.tenant_key;
+                cfgStatusEl.textContent = 'Tenant lagret.';
                 logEl.textContent = JSON.stringify(result, null, 2);
                 await loadTenants();
                 tenantEl.value = tenantKey;
                 await loadTenantConnections();
                 await loadWebhooks();
-                await loadTenantData();
+                try {
+                    await loadTenantData();
+                } catch (err) {
+                    logEl.textContent = 'Tenant lagret, men kunne ikke laste supportdata: ' + String(err);
+                }
             } catch (err) {
                 const errorText = 'Feil ved tenant-lagring: ' + String(err);
                 cfgSaveMessageEl.textContent = errorText;
@@ -1090,7 +1106,7 @@ def dashboard_home() -> str:
                 latestWebhooks = Array.isArray(response.subscriptions) ? response.subscriptions : [];
                 renderWebhookRows(latestWebhooks);
                 if (!webhookTargetUrlEl.value) {
-                    webhookTargetUrlEl.value = window.location.origin + '/webhooks/tripletex/order';
+                    webhookTargetUrlEl.value = appUrl('/webhooks/tripletex/order');
                 }
             } catch (err) {
                 webhookRowsEl.innerHTML = '<tr><td colspan="4" class="muted">Kunne ikke laste subscriptions: ' + String(err) + '</td></tr>';
@@ -1100,59 +1116,69 @@ def dashboard_home() -> str:
         async function loadTenantData() {
             const tenant = tenantEl.value;
             if (!tenant) return;
-            const limit = Math.max(1, Math.min(500, Number(limitEl.value || 50)));
-            const sendable = await api('/api/tenants/' + encodeURIComponent(tenant) + '/sendable-orders?limit=' + limit);
-            const orders = await api('/api/order-sync?tenant_key=' + encodeURIComponent(tenant) + '&limit=' + limit);
-            const events = await api('/api/events?tenant_key=' + encodeURIComponent(tenant) + '&limit=' + limit);
-            latestEvents = (Array.isArray(events) ? events : []).slice(0, 10);
-            if (!selectedEventId && latestEvents.length) {
-                selectedEventId = latestEvents[0].id;
+            try {
+                const limit = Math.max(1, Math.min(500, Number(limitEl.value || 50)));
+                const sendable = await api('/api/tenants/' + encodeURIComponent(tenant) + '/sendable-orders?limit=' + limit);
+                const orders = await api('/api/order-sync?tenant_key=' + encodeURIComponent(tenant) + '&limit=' + limit);
+                const events = await api('/api/events?tenant_key=' + encodeURIComponent(tenant) + '&limit=' + limit);
+                latestEvents = (Array.isArray(events) ? events : []).slice(0, 10);
+                if (!selectedEventId && latestEvents.length) {
+                    selectedEventId = latestEvents[0].id;
+                }
+                if (selectedEventId && !latestEvents.some((event) => String(event.id) === String(selectedEventId))) {
+                    selectedEventId = latestEvents.length ? latestEvents[0].id : null;
+                }
+
+                const visibleEvents = latestEvents.filter(matchesLevelFilter);
+                if (selectedEventId && !visibleEvents.some((event) => String(event.id) === String(selectedEventId))) {
+                    selectedEventId = visibleEvents.length ? visibleEvents[0].id : null;
+                }
+
+                document.getElementById('sendableCount').textContent = sendable.sendable_count;
+                document.getElementById('handledCount').textContent = sendable.already_handled_count;
+                document.getElementById('sendableRows').innerHTML = sendable.sendable_orders.map((r) =>
+                    '<tr>' +
+                        '<td>' + r.tripletex_order_id + '</td>' +
+                        '<td>' + (r.order_number || '-') + '</td>' +
+                        '<td>' + (r.order_date || '-') + '</td>' +
+                        '<td>' + statusTag(r.local_status || 'NEW') + '</td>' +
+                        '<td>' + (r.susoft_uuid || '-') + '</td>' +
+                    '</tr>'
+                ).join('') || '<tr><td colspan="5" class="muted">Ingen sendbare ordre akkurat nå.</td></tr>';
+
+                document.getElementById('orderRows').innerHTML = orders.map((r) =>
+                    '<tr>' +
+                        '<td>' + r.id + '</td>' +
+                        '<td>' + r.tripletex_order_id + '</td>' +
+                        '<td>' + statusTag(r.status) + '</td>' +
+                        '<td>' + (r.susoft_uuid || '-') + '</td>' +
+                        '<td>' + (r.last_error || '-') + '</td>' +
+                        '<td>' + r.updated_at + '</td>' +
+                    '</tr>'
+                ).join('');
+
+                document.getElementById('eventRows').innerHTML = visibleEvents.map((e) => {
+                    const selectedClass = String(e.id) === String(selectedEventId) ? ' selected' : '';
+                    return '<tr class="clickable-row' + selectedClass + '" data-event-id="' + e.id + '">' +
+                        '<td>' + e.id + '</td>' +
+                        '<td>' + statusTag(e.level) + '</td>' +
+                        '<td>' + e.event_type + '</td>' +
+                        '<td>' + e.created_at + '</td>' +
+                    '</tr>';
+                }).join('') || '<tr><td colspan="4" class="muted">Ingen events for valgt filter.</td></tr>';
+
+                const detailRows = visibleEvents.find((event) => String(event.id) === String(selectedEventId)) || visibleEvents[0] || null;
+                renderEventDetail(detailRows);
+                bindEventRowClicks();
+            } catch (err) {
+                document.getElementById('sendableCount').textContent = '-';
+                document.getElementById('handledCount').textContent = '-';
+                document.getElementById('sendableRows').innerHTML = '<tr><td colspan="5" class="muted">Kunne ikke laste sendbare ordre: ' + String(err) + '</td></tr>';
+                document.getElementById('orderRows').innerHTML = '<tr><td colspan="6" class="muted">Kunne ikke laste order sync: ' + String(err) + '</td></tr>';
+                document.getElementById('eventRows').innerHTML = '<tr><td colspan="4" class="muted">Kunne ikke laste events: ' + String(err) + '</td></tr>';
+                renderEventDetail(null);
+                throw err;
             }
-            if (selectedEventId && !latestEvents.some((event) => String(event.id) === String(selectedEventId))) {
-                selectedEventId = latestEvents.length ? latestEvents[0].id : null;
-            }
-
-            const visibleEvents = latestEvents.filter(matchesLevelFilter);
-            if (selectedEventId && !visibleEvents.some((event) => String(event.id) === String(selectedEventId))) {
-                selectedEventId = visibleEvents.length ? visibleEvents[0].id : null;
-            }
-
-            document.getElementById('sendableCount').textContent = sendable.sendable_count;
-            document.getElementById('handledCount').textContent = sendable.already_handled_count;
-            document.getElementById('sendableRows').innerHTML = sendable.sendable_orders.map((r) =>
-                '<tr>' +
-                    '<td>' + r.tripletex_order_id + '</td>' +
-                    '<td>' + (r.order_number || '-') + '</td>' +
-                    '<td>' + (r.order_date || '-') + '</td>' +
-                    '<td>' + statusTag(r.local_status || 'NEW') + '</td>' +
-                    '<td>' + (r.susoft_uuid || '-') + '</td>' +
-                '</tr>'
-            ).join('') || '<tr><td colspan="5" class="muted">Ingen sendbare ordre akkurat nå.</td></tr>';
-
-            document.getElementById('orderRows').innerHTML = orders.map((r) =>
-                '<tr>' +
-                    '<td>' + r.id + '</td>' +
-                    '<td>' + r.tripletex_order_id + '</td>' +
-                    '<td>' + statusTag(r.status) + '</td>' +
-                    '<td>' + (r.susoft_uuid || '-') + '</td>' +
-                    '<td>' + (r.last_error || '-') + '</td>' +
-                    '<td>' + r.updated_at + '</td>' +
-                '</tr>'
-            ).join('');
-
-            document.getElementById('eventRows').innerHTML = visibleEvents.map((e) => {
-                const selectedClass = String(e.id) === String(selectedEventId) ? ' selected' : '';
-                return '<tr class="clickable-row' + selectedClass + '" data-event-id="' + e.id + '">' +
-                    '<td>' + e.id + '</td>' +
-                    '<td>' + statusTag(e.level) + '</td>' +
-                    '<td>' + e.event_type + '</td>' +
-                    '<td>' + e.created_at + '</td>' +
-                '</tr>';
-            }).join('') || '<tr><td colspan="4" class="muted">Ingen events for valgt filter.</td></tr>';
-
-            const detailRows = visibleEvents.find((event) => String(event.id) === String(selectedEventId)) || visibleEvents[0] || null;
-            renderEventDetail(detailRows);
-            bindEventRowClicks();
         }
 
         async function action(url) {
