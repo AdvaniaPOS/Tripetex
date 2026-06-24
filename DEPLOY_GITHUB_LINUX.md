@@ -94,6 +94,23 @@ chmod +x scripts/deploy_pull.sh
 BRANCH=main SERVICE_NAME=tt-susoft.service ./scripts/deploy_pull.sh
 ```
 
+### Post-deploy verifisering (anbefalt)
+
+Kjor dette rett etter deploy for a bekrefte at tjenesten er oppe og svarer:
+
+```bash
+cd ~/Tripletex
+curl -fsS http://127.0.0.1:8000/health
+curl -fsS -u <DASHBOARD_USER>:<DASHBOARD_PASSWORD> http://127.0.0.1:8000/api/status
+sudo journalctl -u tt-susoft.service -n 80 --no-pager
+```
+
+Hvis du vil sjekke siste hendelser for en tenant direkte etter deploy:
+
+```bash
+curl -fsS -u <DASHBOARD_USER>:<DASHBOARD_PASSWORD> "http://127.0.0.1:8000/api/events?tenant_key=<TENANT_KEY>&limit=20"
+```
+
 ## 5) Rollback fast
 
 If something breaks after deploy:
