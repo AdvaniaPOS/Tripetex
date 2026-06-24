@@ -400,3 +400,182 @@ def list_orders_by_date_range(
 
     payload = response.json()
     return payload if isinstance(payload, list) else []
+
+
+def list_product_category_tree(
+    token: str | None = None,
+    *,
+    overrides: dict[str, str] | None = None,
+) -> dict[str, Any] | None:
+    resolved = _resolve_susoft_settings(overrides)
+    auth_token = token or _authenticate(overrides=overrides)
+    url = f"{resolved['base_url']}/product/category/tree"
+
+    headers = _base_headers(overrides=overrides)
+    headers["Authorization"] = f"Bearer {auth_token}"
+
+    try:
+        response = _request_with_rate_limit_retry(
+            "GET",
+            url,
+            timeout=int(resolved["timeout"]),
+            headers=headers,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Nettverksfeil ved henting av Susoft kategori-tre: {exc}") from exc
+
+    if not response.ok:
+        raise RuntimeError(f"Susoft product/category/tree feilet med status {response.status_code}: {response.text}")
+
+    payload = response.json()
+    return payload if isinstance(payload, dict) else None
+
+
+def create_product_category(
+    *,
+    name: str,
+    level: int = 1,
+    vat: float | None = None,
+    alternative_vat: float | None = None,
+    token: str | None = None,
+    overrides: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    resolved = _resolve_susoft_settings(overrides)
+    auth_token = token or _authenticate(overrides=overrides)
+    url = f"{resolved['base_url']}/product/category"
+
+    headers = _base_headers(overrides=overrides)
+    headers["Authorization"] = f"Bearer {auth_token}"
+    body: dict[str, Any] = {
+        "name": str(name).strip(),
+        "level": int(level),
+    }
+    if vat is not None:
+        body["vat"] = float(vat)
+    if alternative_vat is not None:
+        body["alternativeVat"] = float(alternative_vat)
+
+    try:
+        response = _request_with_rate_limit_retry(
+            "POST",
+            url,
+            timeout=int(resolved["timeout"]),
+            headers=headers,
+            json_body=body,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Nettverksfeil ved oppretting av Susoft produktkategori: {exc}") from exc
+
+    if not response.ok:
+        raise RuntimeError(f"Susoft kategori-opprettelse feilet med status {response.status_code}: {response.text}")
+
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("Ugyldig responsformat ved oppretting av Susoft produktkategori")
+    return payload
+
+
+def find_product_by_alternative_id(
+    alternative_id: str,
+    token: str | None = None,
+    *,
+    overrides: dict[str, str] | None = None,
+) -> dict[str, Any] | None:
+    resolved = _resolve_susoft_settings(overrides)
+    auth_token = token or _authenticate(overrides=overrides)
+    url = f"{resolved['base_url']}/product/alternativeid"
+
+    headers = _base_headers(overrides=overrides)
+    headers["Authorization"] = f"Bearer {auth_token}"
+    params = {
+        "alternativeId": str(alternative_id).strip(),
+        "expandAttributeSet": "false",
+        "expandBundles": "false",
+        "expandConfigurable": "false",
+        "expandGrouped": "false",
+    }
+
+    try:
+        response = _request_with_rate_limit_retry(
+            "GET",
+            url,
+            timeout=int(resolved["timeout"]),
+            headers=headers,
+            params=params,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Nettverksfeil ved oppslag av Susoft produkt via alternativeId: {exc}") from exc
+
+    if response.status_code == 404:
+        return None
+    if not response.ok:
+        raise RuntimeError(f"Susoft product/alternativeid feilet med status {response.status_code}: {response.text}")
+
+    payload = response.json()
+    return payload if isinstance(payload, dict) else None
+
+
+def create_product(
+    product_payload: dict[str, Any],
+    token: str | None = None,
+    *,
+    overrides: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    resolved = _resolve_susoft_settings(overrides)
+    auth_token = token or _authenticate(overrides=overrides)
+    url = f"{resolved['base_url']}/product"
+
+    headers = _base_headers(overrides=overrides)
+    headers["Authorization"] = f"Bearer {auth_token}"
+
+    try:
+        response = _request_with_rate_limit_retry(
+            "POST",
+            url,
+            timeout=int(resolved["timeout"]),
+            headers=headers,
+            json_body=product_payload,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Nettverksfeil ved oppretting av Susoft produkt: {exc}") from exc
+
+    if not response.ok:
+        raise RuntimeError(f"Susoft product-opprettelse feilet med status {response.status_code}: {response.text}")
+
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("Ugyldig responsformat ved oppretting av Susoft produkt")
+    return payload
+
+
+def update_product(
+    product_payload: dict[str, Any],
+    token: str | None = None,
+    *,
+    overrides: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    resolved = _resolve_susoft_settings(overrides)
+    auth_token = token or _authenticate(overrides=overrides)
+    url = f"{resolved['base_url']}/product"
+
+    headers = _base_headers(overrides=overrides)
+    headers["Authorization"] = f"Bearer {auth_token}"
+
+    try:
+        response = _request_with_rate_limit_retry(
+            "PUT",
+            url,
+            timeout=int(resolved["timeout"]),
+            headers=headers,
+            json_body=product_payload,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Nettverksfeil ved oppdatering av Susoft produkt: {exc}") from exc
+
+    if not response.ok:
+        raise RuntimeError(f"Susoft product-oppdatering feilet med status {response.status_code}: {response.text}")
+
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("Ugyldig responsformat ved oppdatering av Susoft produkt")
+    return payload

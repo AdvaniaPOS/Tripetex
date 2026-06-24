@@ -25,6 +25,7 @@ from src.sync_service import (
     process_tripletex_order_by_id_for_tenant,
     retry_failed_orders_for_tenant,
     run_manual_sync_for_tenant,
+    sync_products_from_tripletex_for_tenant,
     sync_paid_orders_to_tripletex_for_tenant,
 )
 from src.tripletex_client import create_event_subscription, create_session_token, list_event_subscriptions
@@ -178,18 +179,7 @@ def _run_daily_direct_sales_settlement_worker(stop_event: threading.Event) -> No
                 next_run_by_tenant.pop(key, None)
 
         for tenant in tenants:
-            time_value = _normalize_hhmm(tenant.daily_direct_sales_sync_time, default="23:00")
-            hh, mm = time_value.split(":", 1)
-            target_hour = int(hh)
-            target_minute = int(mm)
-            tz_name = get_settings().tripletex_timezone
-            local_now = now_utc.astimezone(ZoneInfo(tz_name))
-            target_local = local_now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
-            if local_now < target_local:
-                target_local = target_local - timedelta(days=1)
-            settlement_date = target_local.date()
-
-            gate_key = f"{tenant.tenant_key}:{settlement_date.isoformat()}"
+            gate_key = f"{tenant.tenant_key}:{datetime.now(UTC).date().isoformat()}"
             if gate_key in next_run_by_tenant and time.monotonic() < next_run_by_tenant[gate_key]:
                 continue
             next_run_by_tenant[gate_key] = time.monotonic() + 3600.0
@@ -197,7 +187,6 @@ def _run_daily_direct_sales_settlement_worker(stop_event: threading.Event) -> No
             try:
                 calculate_direct_sales_settlement_for_tenant(
                     tenant.tenant_key,
-                    settlement_date=settlement_date,
                     execute=True,
                 )
             except Exception:
@@ -640,6 +629,10 @@ def api_upsert_tenant(payload: dict[str, object]) -> dict[str, object]:
             payload.get("daily_direct_sales_sync_time") if "daily_direct_sales_sync_time" in payload else payload.get("dailyDirectSalesSyncTime"),
             default=row.daily_direct_sales_sync_time or "23:00",
         )
+        row.direct_sales_sales_day_cutoff = _normalize_hhmm(
+            payload.get("direct_sales_sales_day_cutoff") if "direct_sales_sales_day_cutoff" in payload else payload.get("directSalesSalesDayCutoff"),
+            default=row.direct_sales_sales_day_cutoff or "05:00",
+        )
         incoming_default_account = payload.get("direct_sales_default_income_account") if "direct_sales_default_income_account" in payload else payload.get("directSalesDefaultIncomeAccount")
         row.direct_sales_default_income_account = _keep_or_replace_secret(
             row.direct_sales_default_income_account,
@@ -651,6 +644,14 @@ def api_upsert_tenant(payload: dict[str, object]) -> dict[str, object]:
             if incoming_offset_account is not None and str(incoming_offset_account).strip()
             else (row.direct_sales_settlement_offset_account or "1900")
         )
+        row.direct_sales_settlement_send_to_ledger = _to_bool(
+            payload.get("direct_sales_settlement_send_to_ledger") if "direct_sales_settlement_send_to_ledger" in payload else payload.get("directSalesSettlementSendToLedger"),
+            default=row.direct_sales_settlement_send_to_ledger if row.direct_sales_settlement_send_to_ledger is not None else False,
+        )
+        incoming_payment_rules = payload.get("direct_sales_payment_rules_json") if "direct_sales_payment_rules_json" in payload else payload.get("directSalesPaymentRulesJson")
+        row.direct_sales_payment_rules_json = str(incoming_payment_rules).strip() if incoming_payment_rules is not None and str(incoming_payment_rules).strip() else (row.direct_sales_payment_rules_json or "[]")
+        incoming_product_sync_category_rules = payload.get("product_sync_category_rules_json") if "product_sync_category_rules_json" in payload else payload.get("productSyncCategoryRulesJson")
+        row.product_sync_category_rules_json = str(incoming_product_sync_category_rules).strip() if incoming_product_sync_category_rules is not None and str(incoming_product_sync_category_rules).strip() else (row.product_sync_category_rules_json or "[]")
 
         session.commit()
         session.refresh(row)
@@ -664,8 +665,12 @@ def api_upsert_tenant(payload: dict[str, object]) -> dict[str, object]:
         "auto_paid_sync_interval_minutes": row.auto_paid_sync_interval_minutes,
         "daily_direct_sales_sync_enabled": row.daily_direct_sales_sync_enabled,
         "daily_direct_sales_sync_time": row.daily_direct_sales_sync_time,
+        "direct_sales_sales_day_cutoff": row.direct_sales_sales_day_cutoff,
         "direct_sales_default_income_account": row.direct_sales_default_income_account,
         "direct_sales_settlement_offset_account": row.direct_sales_settlement_offset_account,
+        "direct_sales_settlement_send_to_ledger": row.direct_sales_settlement_send_to_ledger,
+        "direct_sales_payment_rules_json": row.direct_sales_payment_rules_json,
+        "product_sync_category_rules_json": row.product_sync_category_rules_json,
         "has_tripletex_tokens": bool(row.tripletex_consumer_token and row.tripletex_employee_token),
         "has_susoft_credentials": bool(row.susoft_shop_url_key and row.susoft_username and row.susoft_password),
     }
@@ -686,8 +691,12 @@ def api_tenant_connections(tenant_key: str) -> dict[str, object]:
         "auto_paid_sync_interval_minutes": row.auto_paid_sync_interval_minutes,
         "daily_direct_sales_sync_enabled": row.daily_direct_sales_sync_enabled,
         "daily_direct_sales_sync_time": row.daily_direct_sales_sync_time,
+        "direct_sales_sales_day_cutoff": row.direct_sales_sales_day_cutoff,
         "direct_sales_default_income_account": row.direct_sales_default_income_account,
         "direct_sales_settlement_offset_account": row.direct_sales_settlement_offset_account,
+        "direct_sales_settlement_send_to_ledger": row.direct_sales_settlement_send_to_ledger,
+        "direct_sales_payment_rules_json": row.direct_sales_payment_rules_json,
+        "product_sync_category_rules_json": row.product_sync_category_rules_json,
         "tripletex_base_url": row.tripletex_base_url or settings.tripletex_base_url,
         "susoft_base_url": row.susoft_base_url or settings.susoft_base_url,
         "has_tripletex_tokens": bool(row.tripletex_consumer_token and row.tripletex_employee_token),
@@ -719,8 +728,11 @@ def api_tenants() -> list[dict[str, object]]:
             "auto_paid_sync_interval_minutes": row.auto_paid_sync_interval_minutes,
             "daily_direct_sales_sync_enabled": row.daily_direct_sales_sync_enabled,
             "daily_direct_sales_sync_time": row.daily_direct_sales_sync_time,
+            "direct_sales_sales_day_cutoff": row.direct_sales_sales_day_cutoff,
             "direct_sales_default_income_account": row.direct_sales_default_income_account,
             "direct_sales_settlement_offset_account": row.direct_sales_settlement_offset_account,
+            "direct_sales_settlement_send_to_ledger": row.direct_sales_settlement_send_to_ledger,
+            "product_sync_category_rules_json": row.product_sync_category_rules_json,
             "has_tripletex_tokens": bool(row.tripletex_consumer_token and row.tripletex_employee_token),
             "has_susoft_credentials": bool(row.susoft_shop_url_key and row.susoft_username and row.susoft_password),
             "created_at": row.created_at.isoformat(),
@@ -902,6 +914,19 @@ def api_direct_sales_settlement_run(
     return result
 
 
+@app.post("/api/tenants/{tenant_key}/products/sync-from-tripletex", dependencies=[Depends(require_dashboard_auth)])
+def api_sync_products_from_tripletex(
+    tenant_key: str,
+    execute: bool = Query(default=False),
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> dict[str, object]:
+    return sync_products_from_tripletex_for_tenant(
+        tenant_key,
+        execute=execute,
+        limit=limit,
+    )
+
+
 @app.get("/api/tenants/{tenant_key}/settlement/direct-sales/runs", dependencies=[Depends(require_dashboard_auth)])
 def api_direct_sales_settlement_runs(tenant_key: str, limit: int = Query(default=30, ge=1, le=365)) -> list[dict[str, object]]:
     with db_session() as session:
@@ -927,6 +952,7 @@ def api_direct_sales_settlement_runs(tenant_key: str, limit: int = Query(default
             "lines_count": row.lines_count,
             "posted_voucher_id": row.posted_voucher_id,
             "message": row.message,
+            "details_json": row.details_json,
             "started_at": row.started_at.isoformat(),
             "finished_at": row.finished_at.isoformat() if row.finished_at else None,
         }
@@ -1288,6 +1314,10 @@ def dashboard_home() -> str:
                         <input id="cfgDailyDirectSalesSyncTime" type="time" value="23:00" />
                     </div>
                     <div>
+                        <div class="toolbar-label">Salgsdag Cutoff (HH:MM)</div>
+                        <input id="cfgDirectSalesSalesDayCutoff" type="time" value="05:00" />
+                    </div>
+                    <div>
                         <div class="toolbar-label">Default Inntektskonto</div>
                         <input id="cfgDirectSalesDefaultIncomeAccount" type="text" placeholder="f.eks. 3000" />
                     </div>
@@ -1295,6 +1325,33 @@ def dashboard_home() -> str:
                         <div class="toolbar-label">Oppgjor Motkonto</div>
                         <input id="cfgDirectSalesSettlementOffsetAccount" type="text" placeholder="f.eks. 1900" value="1900" />
                     </div>
+                    <div>
+                        <div class="toolbar-label">Bokforingsmodus</div>
+                        <select id="cfgDirectSalesSettlementSendToLedger">
+                            <option value="false">Bilag til inbox, ikke bokfor</option>
+                            <option value="true">Auto-bokfor i Tripletex</option>
+                        </select>
+                    </div>
+                    <div style="grid-column: span 4;">
+                        <div class="toolbar-label">Betalingsmåter / posteringsregler (JSON)</div>
+                        <textarea id="cfgDirectSalesPaymentRulesJson" rows="6" style="width: 100%; border: 1px solid var(--line); border-radius: 12px; padding: 12px; font-family: Consolas, monospace; font-size: 12px;">[
+  {"match": "CASH", "name": "Kontant", "account": "1900"},
+  {"match": "VIPPS", "name": "Vipps", "account": "1920"},
+  {"match": "CREDIT_CARD", "name": "Kort", "account": "1920"},
+  {"match": "TERMINAL:VISA", "name": "Visa", "account": "1920"},
+  {"match": "TERMINAL:MASTERCARD", "name": "Mastercard", "account": "1920"},
+  {"match": "TERMINAL:BANKAXEPT", "name": "BankAxept", "account": "1920"},
+  {"match": "GIFT_CARD", "name": "Gavekort", "account": "2900"}
+]</textarea>
+                    </div>
+                                        <div style="grid-column: span 4;">
+                                                <div class="toolbar-label">Produktsynk kategori-regler (TT konto -> Susoft kategori, JSON)</div>
+                                                <textarea id="cfgProductSyncCategoryRulesJson" rows="6" style="width: 100%; border: 1px solid var(--line); border-radius: 12px; padding: 12px; font-family: Consolas, monospace; font-size: 12px;">[
+    {"match": "3000", "susoft_category_name": "Bakervarer"},
+    {"match": "3100", "susoft_category_name": "Drikke"},
+    {"match": "3200", "susoft_category_name": "Annet"}
+]</textarea>
+                                        </div>
                     <div>
                         <div class="toolbar-label">Connection Status</div>
                         <div id="cfgStatus" class="muted">Velg eller opprett tenant.</div>
@@ -1322,6 +1379,8 @@ def dashboard_home() -> str:
                 </div>
                 <button id="dry">Manual Sync (Dry)</button>
                 <button id="exec">Manual Sync (Execute)</button>
+                <button class="secondary" id="syncProductsPreview">Sync Products (Preview)</button>
+                <button id="syncProductsExecute">Sync Products (Execute)</button>
                 <button class="secondary" id="retry">Retry Failed</button>
                 <button class="secondary" id="paid">Sync Paid -> TT</button>
                 <button class="secondary" id="refresh">Refresh</button>
@@ -1369,6 +1428,42 @@ def dashboard_home() -> str:
                     <table>
                         <thead><tr><th>ID</th><th>Type</th><th>Active</th><th>URL</th><th>Last Error</th></tr></thead>
                         <tbody id="susoftWebhookRows"><tr><td colspan="5" class="muted">Ingen webhooks lastet ennå.</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h3>Direktesalg Oppgjør</h3>
+                <div class="controls">
+                    <div>
+                        <div class="toolbar-label">Settlement Date</div>
+                        <input id="directSalesSettlementDate" type="date" />
+                    </div>
+                    <button id="settlementPreview" class="secondary" type="button">Preview</button>
+                    <button id="settlementExecute" type="button">Execute</button>
+                    <button id="settlementRefresh" class="secondary" type="button">Refresh</button>
+                </div>
+                <div class="table-wrap" style="margin-top: 12px;">
+                    <table>
+                        <thead><tr><th>Date</th><th>Status</th><th>Susoft</th><th>TT</th><th>Netto</th><th>Voucher</th><th>Sales Cutoff</th></tr></thead>
+                        <tbody id="settlementRunsRows"><tr><td colspan="7" class="muted">Ingen settlement runs lastet ennå.</td></tr></tbody>
+                    </table>
+                </div>
+                <div class="table-wrap" style="margin-top: 12px;">
+                    <table>
+                        <thead><tr><th>Selected Run Detail</th><th>Value</th></tr></thead>
+                        <tbody id="settlementDetailRows"><tr><td class="muted">Velg en settlement-run for detaljer.</td><td>-</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h3>Produktsynk TT -> Susoft</h3>
+                <div class="muted" id="productSyncSummary">Kjor preview eller execute for a se resultat per produkt.</div>
+                <div class="table-wrap" style="margin-top: 12px;">
+                    <table>
+                        <thead><tr><th>Status</th><th>TT Produkt</th><th>Susoft Produkt</th><th>Kategori</th><th>Kildekonto</th><th>Kategori Match</th></tr></thead>
+                        <tbody id="productSyncRows"><tr><td colspan="6" class="muted">Ingen produktsynk-resultater enda.</td></tr></tbody>
                     </table>
                 </div>
             </div>
@@ -1458,21 +1553,33 @@ def dashboard_home() -> str:
         const cfgAutoPaidSyncIntervalMinutesEl = document.getElementById('cfgAutoPaidSyncIntervalMinutes');
         const cfgDailyDirectSalesSyncEnabledEl = document.getElementById('cfgDailyDirectSalesSyncEnabled');
         const cfgDailyDirectSalesSyncTimeEl = document.getElementById('cfgDailyDirectSalesSyncTime');
+        const cfgDirectSalesSalesDayCutoffEl = document.getElementById('cfgDirectSalesSalesDayCutoff');
         const cfgDirectSalesDefaultIncomeAccountEl = document.getElementById('cfgDirectSalesDefaultIncomeAccount');
         const cfgDirectSalesSettlementOffsetAccountEl = document.getElementById('cfgDirectSalesSettlementOffsetAccount');
+        const cfgDirectSalesSettlementSendToLedgerEl = document.getElementById('cfgDirectSalesSettlementSendToLedger');
+        const cfgDirectSalesPaymentRulesJsonEl = document.getElementById('cfgDirectSalesPaymentRulesJson');
+        const cfgProductSyncCategoryRulesJsonEl = document.getElementById('cfgProductSyncCategoryRulesJson');
         const cfgStatusEl = document.getElementById('cfgStatus');
         const cfgSaveMessageEl = document.getElementById('cfgSaveMessage');
         const tenantListRowsEl = document.getElementById('tenantListRows');
         const webhookTargetUrlEl = document.getElementById('webhookTargetUrl');
         const susoftWebhookTargetUrlEl = document.getElementById('susoftWebhookTargetUrl');
+        const directSalesSettlementDateEl = document.getElementById('directSalesSettlementDate');
         const logEl = document.getElementById('log');
         const eventsLevelFilterEl = document.getElementById('eventsLevelFilter');
         const webhookRowsEl = document.getElementById('webhookRows');
         const susoftWebhookRowsEl = document.getElementById('susoftWebhookRows');
+        const settlementRunsRowsEl = document.getElementById('settlementRunsRows');
+        const settlementDetailRowsEl = document.getElementById('settlementDetailRows');
+        const productSyncSummaryEl = document.getElementById('productSyncSummary');
+        const productSyncRowsEl = document.getElementById('productSyncRows');
         let latestEvents = [];
         let selectedEventId = null;
         let latestWebhooks = [];
         let latestSusoftWebhooks = [];
+        let latestSettlementRuns = [];
+        let selectedSettlementRunId = null;
+        let latestProductSyncResult = null;
 
         function stamp() {
             document.getElementById('now').textContent = new Date().toLocaleString();
@@ -1548,6 +1655,93 @@ def dashboard_home() -> str:
             }).join('') || '<tr><td colspan="5" class="muted">Ingen webhooks funnet.</td></tr>';
         }
 
+        function renderProductSyncResult(result) {
+            if (!result || typeof result !== 'object') {
+                productSyncSummaryEl.textContent = 'Kjor preview eller execute for a se resultat per produkt.';
+                productSyncRowsEl.innerHTML = '<tr><td colspan="6" class="muted">Ingen produktsynk-resultater enda.</td></tr>';
+                return;
+            }
+
+            const rows = Array.isArray(result.results) ? result.results : [];
+            productSyncSummaryEl.textContent =
+                'Status: ' + String(result.status || '-') +
+                ' | Checked: ' + String(result.checked || 0) +
+                ' | Created: ' + String(result.created || 0) +
+                ' | Updated: ' + String(result.updated || 0) +
+                ' | Created categories: ' + String(result.created_categories || 0) +
+                ' | Errors: ' + String(result.errors || 0);
+
+            productSyncRowsEl.innerHTML = rows.map((row) => {
+                const categoryCell = String(row.category_id || '-') + ' / ' + String(row.category_name || '-');
+                const accountCell = String(row.tripletex_account_number || '-') + ' / ' + String(row.tripletex_account_name || '-');
+                return '<tr>' +
+                    '<td>' + statusTag(row.status || '-') + '</td>' +
+                    '<td>' + String(row.tripletex_product_id || '-') + ' - ' + String(row.tripletex_name || '-') + '</td>' +
+                    '<td>' + String(row.susoft_product_id || '-') + '</td>' +
+                    '<td>' + categoryCell + '</td>' +
+                    '<td>' + accountCell + '</td>' +
+                    '<td>' + String(row.category_resolution || '-') + '</td>' +
+                '</tr>';
+            }).join('') || '<tr><td colspan="6" class="muted">Ingen rader i dette resultatet.</td></tr>';
+        }
+
+        function prettyJson(value) {
+            if (value === null || value === undefined || value === '') return '-';
+            if (typeof value === 'string') {
+                try {
+                    return JSON.stringify(JSON.parse(value), null, 2);
+                } catch (_) {
+                    return value;
+                }
+            }
+            return JSON.stringify(value, null, 2);
+        }
+
+        function renderSettlementDetail(runItem) {
+            settlementDetailRowsEl.innerHTML = runItem
+                ? [
+                    ['ID', runItem.id],
+                    ['Date', runItem.settlement_date],
+                    ['Status', runItem.status],
+                    ['Susoft Gross', runItem.direct_sales_gross],
+                    ['TT Linked Gross', runItem.tt_linked_gross],
+                    ['Net Transfer', runItem.net_transfer_gross],
+                    ['Lines', runItem.lines_count],
+                    ['Voucher', runItem.posted_voucher_id || '-'],
+                    ['Sales Cutoff', runItem.sales_day_cutoff || '-'],
+                    ['Send To Ledger', String(runItem.send_to_ledger)],
+                    ['Message', runItem.message || '-'],
+                    ['Details JSON', prettyJson(runItem.details_json || null)],
+                ].map(([label, value]) => '<tr><td class="muted">' + label + '</td><td><pre style="margin:0; white-space:pre-wrap; word-break:break-word;">' + String(value ?? '-') + '</pre></td></tr>').join('')
+                : '<tr><td class="muted">Ingen settlement-run valgt</td><td>-</td></tr>';
+        }
+
+        function renderSettlementRuns(items) {
+            settlementRunsRowsEl.innerHTML = items.map((item) => {
+                const selectedClass = String(item.id) === String(selectedSettlementRunId) ? ' selected' : '';
+                return '<tr class="clickable-row' + selectedClass + '" data-settlement-run-id="' + item.id + '">' +
+                    '<td>' + (item.settlement_date || '-') + '</td>' +
+                    '<td>' + statusTag(item.status || '-') + '</td>' +
+                    '<td>' + (item.direct_sales_gross || '-') + '</td>' +
+                    '<td>' + (item.tt_linked_gross || '-') + '</td>' +
+                    '<td>' + (item.net_transfer_gross || '-') + '</td>' +
+                    '<td>' + (item.posted_voucher_id || '-') + '</td>' +
+                    '<td>' + (item.sales_day_cutoff || '-') + '</td>' +
+                '</tr>';
+            }).join('') || '<tr><td colspan="7" class="muted">Ingen settlement runs funnet.</td></tr>';
+
+            document.querySelectorAll('#settlementRunsRows .clickable-row').forEach((row) => {
+                row.addEventListener('click', () => {
+                    selectedSettlementRunId = row.getAttribute('data-settlement-run-id');
+                    const selectedRun = latestSettlementRuns.find((run) => String(run.id) === String(selectedSettlementRunId)) || null;
+                    document.querySelectorAll('#settlementRunsRows .clickable-row').forEach((item) => {
+                        item.classList.toggle('selected', item.getAttribute('data-settlement-run-id') === String(selectedSettlementRunId));
+                    });
+                    renderSettlementDetail(selectedRun);
+                });
+            });
+        }
+
         function renderTenantListRows(tenants) {
             tenantListRowsEl.innerHTML = tenants.map((tenant) => {
                 return '<tr>' +
@@ -1568,8 +1762,12 @@ def dashboard_home() -> str:
                     const tenantKey = decodeURIComponent(button.getAttribute('data-tenant-key') || '');
                     if (!tenantKey) return;
                     tenantEl.value = tenantKey;
+                    latestProductSyncResult = null;
+                    renderProductSyncResult(null);
                     await loadTenantConnections();
                     await loadWebhooks();
+                    await loadSusoftWebhooks();
+                    await loadSettlementRuns();
                     await loadTenantData();
                     setMenu('menuSupport');
                 });
@@ -1665,8 +1863,12 @@ def dashboard_home() -> str:
                 cfgAutoPaidSyncIntervalMinutesEl.value = String(info.auto_paid_sync_interval_minutes || 1);
                 cfgDailyDirectSalesSyncEnabledEl.value = String(info.daily_direct_sales_sync_enabled === true);
                 cfgDailyDirectSalesSyncTimeEl.value = String(info.daily_direct_sales_sync_time || '23:00');
+                cfgDirectSalesSalesDayCutoffEl.value = String(info.direct_sales_sales_day_cutoff || '05:00');
                 cfgDirectSalesDefaultIncomeAccountEl.value = String(info.direct_sales_default_income_account || '');
                 cfgDirectSalesSettlementOffsetAccountEl.value = String(info.direct_sales_settlement_offset_account || '1900');
+                cfgDirectSalesSettlementSendToLedgerEl.value = String(info.direct_sales_settlement_send_to_ledger === true);
+                cfgDirectSalesPaymentRulesJsonEl.value = prettyJson(info.direct_sales_payment_rules_json || '[]');
+                cfgProductSyncCategoryRulesJsonEl.value = prettyJson(info.product_sync_category_rules_json || '[]');
                 const tt = info.has_tripletex_tokens ? 'TT OK' : 'TT mangler';
                 const ss = info.has_susoft_credentials ? 'Susoft OK' : 'Susoft mangler';
                 const autoPolling = (info.auto_paid_sync_enabled !== false)
@@ -1716,8 +1918,12 @@ def dashboard_home() -> str:
                 auto_paid_sync_interval_minutes: Number(cfgAutoPaidSyncIntervalMinutesEl.value || 1),
                 daily_direct_sales_sync_enabled: String(cfgDailyDirectSalesSyncEnabledEl.value || 'false') === 'true',
                 daily_direct_sales_sync_time: String(cfgDailyDirectSalesSyncTimeEl.value || '23:00'),
+                direct_sales_sales_day_cutoff: String(cfgDirectSalesSalesDayCutoffEl.value || '05:00'),
                 direct_sales_default_income_account: String(cfgDirectSalesDefaultIncomeAccountEl.value || '').trim(),
                 direct_sales_settlement_offset_account: String(cfgDirectSalesSettlementOffsetAccountEl.value || '1900').trim(),
+                direct_sales_settlement_send_to_ledger: String(cfgDirectSalesSettlementSendToLedgerEl.value || 'false') === 'true',
+                direct_sales_payment_rules_json: String(cfgDirectSalesPaymentRulesJsonEl.value || '[]').trim(),
+                product_sync_category_rules_json: String(cfgProductSyncCategoryRulesJsonEl.value || '[]').trim(),
             };
 
             try {
@@ -1805,6 +2011,30 @@ def dashboard_home() -> str:
             }
         }
 
+        async function loadSettlementRuns() {
+            const tenant = tenantEl.value;
+            if (!tenant) {
+                settlementRunsRowsEl.innerHTML = '<tr><td colspan="7" class="muted">Velg tenant for oppgjørsvisning.</td></tr>';
+                settlementDetailRowsEl.innerHTML = '<tr><td class="muted">Velg tenant for oppgjørsvisning.</td><td>-</td></tr>';
+                return;
+            }
+            try {
+                const response = await api('/api/tenants/' + encodeURIComponent(tenant) + '/settlement/direct-sales/runs?limit=10');
+                latestSettlementRuns = Array.isArray(response) ? response : [];
+                if (!selectedSettlementRunId && latestSettlementRuns.length) {
+                    selectedSettlementRunId = latestSettlementRuns[0].id;
+                }
+                if (selectedSettlementRunId && !latestSettlementRuns.some((run) => String(run.id) === String(selectedSettlementRunId))) {
+                    selectedSettlementRunId = latestSettlementRuns.length ? latestSettlementRuns[0].id : null;
+                }
+                renderSettlementRuns(latestSettlementRuns);
+                renderSettlementDetail(latestSettlementRuns.find((run) => String(run.id) === String(selectedSettlementRunId)) || latestSettlementRuns[0] || null);
+            } catch (err) {
+                settlementRunsRowsEl.innerHTML = '<tr><td colspan="7" class="muted">Kunne ikke laste oppgjørsruns: ' + String(err) + '</td></tr>';
+                settlementDetailRowsEl.innerHTML = '<tr><td class="muted">Kunne ikke laste oppgjørsruns</td><td>-</td></tr>';
+            }
+        }
+
         async function loadTenantData() {
             const tenant = tenantEl.value;
             if (!tenant) return;
@@ -1878,6 +2108,10 @@ def dashboard_home() -> str:
                 logEl.textContent = 'Kjorer: ' + url;
                 const data = await api(url, { method: 'POST' });
                 logEl.textContent = JSON.stringify(data, null, 2);
+                if (url.includes('/products/sync-from-tripletex')) {
+                    latestProductSyncResult = data;
+                    renderProductSyncResult(latestProductSyncResult);
+                }
                 await loadAll();
             } catch (err) {
                 logEl.textContent = 'Feil: ' + err;
@@ -1891,14 +2125,19 @@ def dashboard_home() -> str:
             await loadTenantConnections();
             await loadWebhooks();
             await loadSusoftWebhooks();
+            await loadSettlementRuns();
             await loadTenantData();
         }
 
         document.getElementById('refresh').addEventListener('click', loadAll);
         tenantEl.addEventListener('change', async () => {
+            selectedSettlementRunId = null;
+            latestProductSyncResult = null;
+            renderProductSyncResult(null);
             await loadTenantConnections();
             await loadWebhooks();
             await loadSusoftWebhooks();
+            await loadSettlementRuns();
             await loadTenantData();
         });
         document.getElementById('dry').addEventListener('click', () => {
@@ -1910,6 +2149,16 @@ def dashboard_home() -> str:
             const t = tenantEl.value;
             const l = Number(limitEl.value || 50);
             action('/api/tenants/' + encodeURIComponent(t) + '/sync/manual?dry_run=false&limit=' + l);
+        });
+        document.getElementById('syncProductsPreview').addEventListener('click', () => {
+            const t = tenantEl.value;
+            const l = Number(limitEl.value || 200);
+            action('/api/tenants/' + encodeURIComponent(t) + '/products/sync-from-tripletex?execute=false&limit=' + l);
+        });
+        document.getElementById('syncProductsExecute').addEventListener('click', () => {
+            const t = tenantEl.value;
+            const l = Number(limitEl.value || 200);
+            action('/api/tenants/' + encodeURIComponent(t) + '/products/sync-from-tripletex?execute=true&limit=' + l);
         });
         document.getElementById('retry').addEventListener('click', () => {
             const t = tenantEl.value;
@@ -1951,6 +2200,25 @@ def dashboard_home() -> str:
             }
             action('/api/susoft/webhooks/order-invoiced?tenant_key=' + encodeURIComponent(tenant) + '&target_url=' + encodeURIComponent(targetUrl));
         });
+        document.getElementById('settlementPreview').addEventListener('click', () => {
+            const tenant = tenantEl.value;
+            const settlementDate = String(directSalesSettlementDateEl.value || '').trim();
+            if (!tenant || !settlementDate) {
+                logEl.textContent = 'Feil: velg tenant og settlement date';
+                return;
+            }
+            action('/api/tenants/' + encodeURIComponent(tenant) + '/settlement/direct-sales/run?settlement_date=' + encodeURIComponent(settlementDate) + '&dry_run=true');
+        });
+        document.getElementById('settlementExecute').addEventListener('click', () => {
+            const tenant = tenantEl.value;
+            const settlementDate = String(directSalesSettlementDateEl.value || '').trim();
+            if (!tenant || !settlementDate) {
+                logEl.textContent = 'Feil: velg tenant og settlement date';
+                return;
+            }
+            action('/api/tenants/' + encodeURIComponent(tenant) + '/settlement/direct-sales/run?settlement_date=' + encodeURIComponent(settlementDate) + '&dry_run=false');
+        });
+        document.getElementById('settlementRefresh').addEventListener('click', loadSettlementRuns);
 
         document.getElementById('saveTenantConfig').addEventListener('click', saveTenantConfig);
         document.getElementById('cfgLoadExistingTenant').addEventListener('click', async () => {
@@ -1979,8 +2247,12 @@ def dashboard_home() -> str:
             cfgAutoPaidSyncIntervalMinutesEl.value = '1';
             cfgDailyDirectSalesSyncEnabledEl.value = 'false';
             cfgDailyDirectSalesSyncTimeEl.value = '23:00';
+            cfgDirectSalesSalesDayCutoffEl.value = '05:00';
             cfgDirectSalesDefaultIncomeAccountEl.value = '';
             cfgDirectSalesSettlementOffsetAccountEl.value = '1900';
+            cfgDirectSalesSettlementSendToLedgerEl.value = 'false';
+            cfgDirectSalesPaymentRulesJsonEl.value = '[\n  {"match": "CASH", "name": "Kontant", "account": "1900"},\n  {"match": "VIPPS", "name": "Vipps", "account": "1920"},\n  {"match": "CREDIT_CARD", "name": "Kort", "account": "1920"},\n  {"match": "TERMINAL:VISA", "name": "Visa", "account": "1920"},\n  {"match": "TERMINAL:MASTERCARD", "name": "Mastercard", "account": "1920"},\n  {"match": "TERMINAL:BANKAXEPT", "name": "BankAxept", "account": "1920"},\n  {"match": "GIFT_CARD", "name": "Gavekort", "account": "2900"}\n]';
+            cfgProductSyncCategoryRulesJsonEl.value = '[\n  {"match": "3000", "susoft_category_name": "Bakervarer"},\n  {"match": "3100", "susoft_category_name": "Drikke"},\n  {"match": "3200", "susoft_category_name": "Annet"}\n]';
             cfgSaveMessageEl.textContent = 'Edit mode ryddet. Klar for ny tenant.';
             cfgStatusEl.textContent = 'Ny tenant-modus.';
         });

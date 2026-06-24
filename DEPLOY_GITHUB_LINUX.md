@@ -106,3 +106,30 @@ sudo systemctl restart tt-susoft.service
 ```
 
 Then make a proper fix and push forward.
+
+## 6) Endringslogg (siste leveranser)
+
+### 2026-06-24
+
+1. Fullfort direkte-salg oppgjor med bedre transparens i dashboard:
+	- settlement runs + detaljvisning
+	- payload med payment breakdown, ordredetaljer, posting-resultat
+	- valgfri auto-bokforing i Tripletex (inbox eller auto)
+2. Innfort salgsdag-cutoff (default 05:00) for oppgjor.
+3. Lagt til betalingstype-regler per tenant (JSON), for eksempel kontant, kort, Vipps, gavekort og kortsubtyper.
+4. Lagt til redigering av eksisterende tenants i UI, inkludert robust DB-backfill av nye kolonner for eldre installasjoner.
+5. Implementert TT som master for produktsynk mot Susoft:
+	- ny synk: TT produkt -> Susoft produkt (opprett/oppdater)
+	- felter: varenavn, mva, pris, aktiv/inaktiv
+	- kobling via alternativeId: TT:{tripletex_product_id}
+6. Implementert kategori-matching fra TT inntektskonto til Susoft kategori med overstyring:
+	- matcher mot Susoft kategori via id eller navn
+	- kan opprette ny kategori ved execute hvis ingen match finnes
+	- regler lagres per tenant i product_sync_category_rules_json
+7. Nytt API-endepunkt for produktsynk:
+	- POST /api/tenants/{tenant_key}/products/sync-from-tripletex?execute=false|true&limit=...
+8. Oppdatert dashboard med:
+	- Sync Products (Preview/Execute)-knapper
+	- egen resultattabell for produktsynk per produkt (status, kategori, konto, match)
+9. Ny CLI-kommando for produktsynk:
+	- python manage.py sync-products --tenant-key <key> [--execute] [--limit 200]

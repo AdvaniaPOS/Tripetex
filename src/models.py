@@ -29,8 +29,12 @@ class Tenant(Base):
     auto_paid_sync_interval_minutes: Mapped[int] = mapped_column(Integer, default=1)
     daily_direct_sales_sync_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     daily_direct_sales_sync_time: Mapped[str] = mapped_column(String(5), default="23:00")
+    direct_sales_sales_day_cutoff: Mapped[str | None] = mapped_column(String(5), nullable=True)
     direct_sales_default_income_account: Mapped[str | None] = mapped_column(String(20), nullable=True)
     direct_sales_settlement_offset_account: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    direct_sales_settlement_send_to_ledger: Mapped[bool] = mapped_column(Boolean, default=False)
+    direct_sales_payment_rules_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    product_sync_category_rules_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
 

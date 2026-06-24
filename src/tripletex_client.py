@@ -124,6 +124,38 @@ def fetch_open_orders(session_token: str, *, overrides: dict[str, str] | None = 
     return payload
 
 
+def list_products(
+    session_token: str,
+    *,
+    include_inactive: bool = False,
+    limit: int = 200,
+    overrides: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    resolved = _resolve_tripletex_settings(overrides)
+    url = f"{resolved['base_url']}/product"
+    headers = _auth_headers(session_token)
+    safe_limit = max(1, min(1000, int(limit)))
+    params = {
+        "count": str(safe_limit),
+        "isInactive": "true" if include_inactive else "false",
+        "fields": "id,number,name,isInactive,priceExcludingVatCurrency,priceIncludingVatCurrency,vatType(id,number,name,percentage),account(id,number,name)",
+    }
+
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=TIMEOUT_SECONDS)
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Nettverksfeil ved henting av Tripletex-produkter: {exc}") from exc
+
+    if not response.ok:
+        raise RuntimeError(f"Tripletex produkt-kall feilet med status {response.status_code}: {response.text}")
+
+    payload = response.json()
+    values = payload.get("values") if isinstance(payload, dict) else None
+    if not isinstance(values, list):
+        return []
+    return [row for row in values if isinstance(row, dict)]
+
+
 def list_event_subscriptions(session_token: str, *, overrides: dict[str, str] | None = None) -> list[dict[str, Any]]:
     resolved = _resolve_tripletex_settings(overrides)
     url = f"{resolved['base_url']}/event/subscription"

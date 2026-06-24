@@ -4,6 +4,27 @@
 Hente ordredata fra Tripletex API v2 testmiljo og eksportere JSON klar for videre mapping/import mot Susoft.
 
 ## Changelog
+### 2026-06-24
+1. Ferdigstilte direct-sales oppgjor med egen run-historikk og detaljvisning i dashboard.
+2. La inn salgsdag-cutoff (default 05:00) og robust beregning av oppgjor-vindu.
+3. La inn bokforingsmodus for oppgjor: inbox (ikke auto-bokfor) eller auto-bokfor i Tripletex.
+4. Utvidet oppgjor med detaljer: payment_method_breakdown, direct_sales_orders_detail og posting_result.
+5. La inn tenant-redigering i dashboard og sikret startup-backfill av nye tenant-kolonner i eksisterende databaser.
+6. Implementerte TT som master for produktsynk til Susoft:
+   - henter produkter fra Tripletex
+   - finner/oppdaterer/oppretter produkter i Susoft via alternativeId
+   - synker navn, mva, pris og aktiv-status
+7. Implementerte konto -> kategori-overstyring per tenant via JSON-regler:
+   - matcher kategori mot Susoft via kategori-id eller kategorinavn
+   - oppretter kategori ved execute hvis ingen match finnes
+8. La til API for produktsynk:
+   - POST /api/tenants/{tenant_key}/products/sync-from-tripletex
+9. La til dashboard-wiring for produktsynk:
+   - Sync Products (Preview/Execute)
+   - resultat-tabell per produkt med status, kategori, kontokilde og match-metode
+10. La til CLI-kommando for produktsynk:
+   - manage.py sync-products
+
 ### 2026-06-19
 1. Etablerte autentisering mot Tripletex testmiljo via session token.
 2. Avklarte at ordre hentes med Basic auth-format 0:sessionToken i dette miljoet.

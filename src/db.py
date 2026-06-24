@@ -35,8 +35,12 @@ def _ensure_schema_compatibility() -> None:
         "auto_paid_sync_interval_minutes": "INTEGER DEFAULT 1",
         "daily_direct_sales_sync_enabled": "BOOLEAN DEFAULT FALSE",
         "daily_direct_sales_sync_time": "VARCHAR(5) DEFAULT '23:00'",
+        "direct_sales_sales_day_cutoff": "VARCHAR(5) DEFAULT '05:00'",
         "direct_sales_default_income_account": "VARCHAR(20)",
         "direct_sales_settlement_offset_account": "VARCHAR(20) DEFAULT '1900'",
+        "direct_sales_settlement_send_to_ledger": "BOOLEAN DEFAULT FALSE",
+        "direct_sales_payment_rules_json": "TEXT",
+        "product_sync_category_rules_json": "TEXT",
     }
 
     with engine.begin() as conn:
@@ -84,6 +88,14 @@ def _ensure_schema_compatibility() -> None:
                         conn.execute(text("UPDATE tenants SET daily_direct_sales_sync_time = '23:00' WHERE daily_direct_sales_sync_time IS NULL"))
                     elif col_name == "direct_sales_settlement_offset_account":
                         conn.execute(text("UPDATE tenants SET direct_sales_settlement_offset_account = '1900' WHERE direct_sales_settlement_offset_account IS NULL"))
+                    elif col_name == "direct_sales_sales_day_cutoff":
+                        conn.execute(text("UPDATE tenants SET direct_sales_sales_day_cutoff = '05:00' WHERE direct_sales_sales_day_cutoff IS NULL"))
+                    elif col_name == "direct_sales_settlement_send_to_ledger":
+                        conn.execute(text("UPDATE tenants SET direct_sales_settlement_send_to_ledger = FALSE WHERE direct_sales_settlement_send_to_ledger IS NULL"))
+                    elif col_name == "direct_sales_payment_rules_json":
+                        conn.execute(text("UPDATE tenants SET direct_sales_payment_rules_json = '[]' WHERE direct_sales_payment_rules_json IS NULL"))
+                    elif col_name == "product_sync_category_rules_json":
+                        conn.execute(text("UPDATE tenants SET product_sync_category_rules_json = '[]' WHERE product_sync_category_rules_json IS NULL"))
                 except Exception:
                     # Keep startup resilient if backfill syntax differs across DB engines.
                     pass

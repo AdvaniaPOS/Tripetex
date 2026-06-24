@@ -12,6 +12,7 @@ from src.sync_service import (
     get_sendable_orders_for_tenant,
     retry_failed_orders_for_tenant,
     run_manual_sync_for_tenant,
+    sync_products_from_tripletex_for_tenant,
     sync_paid_orders_to_tripletex_for_tenant,
 )
 
@@ -116,6 +117,15 @@ def cmd_direct_sales_settlement(args: argparse.Namespace) -> None:
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
+def cmd_sync_products(args: argparse.Namespace) -> None:
+    result = sync_products_from_tripletex_for_tenant(
+        args.tenant_key,
+        execute=args.execute,
+        limit=args.limit,
+    )
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Local admin commands for TT-Susoft sync service")
     sub = parser.add_subparsers(required=True)
@@ -179,6 +189,15 @@ def build_parser() -> argparse.ArgumentParser:
     settlement_parser.add_argument("--settlement-date", default=None, help="YYYY-MM-DD (default: yesterday in business timezone)")
     settlement_parser.add_argument("--execute", action="store_true", help="Mark run as execute (posting implementation pending)")
     settlement_parser.set_defaults(func=cmd_direct_sales_settlement)
+
+    sync_products_parser = sub.add_parser(
+        "sync-products",
+        help="Sync products from Tripletex to Susoft (preview by default)",
+    )
+    sync_products_parser.add_argument("--tenant-key", required=True)
+    sync_products_parser.add_argument("--limit", type=int, default=200)
+    sync_products_parser.add_argument("--execute", action="store_true")
+    sync_products_parser.set_defaults(func=cmd_sync_products)
 
     return parser
 
