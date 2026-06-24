@@ -575,6 +575,7 @@ def _push_order_to_susoft(
     job_run_id: int | None,
     order_sync: OrderSync,
     order_payload: dict[str, Any],
+    susoft_token: str | None = None,
     susoft_overrides: dict[str, str] | None = None,
 ) -> bool:
     try:
@@ -591,7 +592,7 @@ def _push_order_to_susoft(
             return True
 
         mapped = _build_susoft_order_payload(order_payload)
-        created = create_susoft_order(mapped, overrides=susoft_overrides)
+        created = create_susoft_order(mapped, token=susoft_token, overrides=susoft_overrides)
 
         order_sync.status = "PUSHED_TO_SUSOFT"
         order_sync.last_error = None
@@ -659,6 +660,7 @@ def run_manual_sync_for_tenant(tenant_key: str, *, dry_run: bool, limit: int) ->
         try:
             tripletex_overrides = _tripletex_overrides_for_tenant(tenant)
             susoft_overrides = _susoft_overrides_for_tenant(tenant)
+            susoft_token = None if dry_run else susoft_authenticate(overrides=susoft_overrides)
             token = create_session_token(overrides=tripletex_overrides)
             payload = fetch_open_orders(token, overrides=tripletex_overrides)
             values = payload.get("values")
@@ -733,6 +735,7 @@ def run_manual_sync_for_tenant(tenant_key: str, *, dry_run: bool, limit: int) ->
                     job_run_id=job.id,
                     order_sync=order_sync,
                     order_payload=order,
+                    susoft_token=susoft_token,
                     susoft_overrides=susoft_overrides,
                 )
                 if ok:
@@ -797,6 +800,7 @@ def retry_failed_orders_for_tenant(tenant_key: str, *, limit: int) -> dict[str, 
 
         try:
             susoft_overrides = _susoft_overrides_for_tenant(tenant)
+            susoft_token = susoft_authenticate(overrides=susoft_overrides)
             rows = session.scalars(
                 select(OrderSync)
                 .where(OrderSync.tenant_id == tenant.id, OrderSync.status == "FAILED")
@@ -830,6 +834,7 @@ def retry_failed_orders_for_tenant(tenant_key: str, *, limit: int) -> dict[str, 
                     job_run_id=job.id,
                     order_sync=row,
                     order_payload=payload,
+                    susoft_token=susoft_token,
                     susoft_overrides=susoft_overrides,
                 )
                 if ok:

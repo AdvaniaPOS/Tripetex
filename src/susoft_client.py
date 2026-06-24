@@ -61,13 +61,18 @@ def authenticate(*, overrides: dict[str, str] | None = None) -> str:
     return _authenticate(overrides=overrides)
 
 
-def create_order(order_payload: dict[str, Any], *, overrides: dict[str, str] | None = None) -> dict[str, Any]:
+def create_order(
+    order_payload: dict[str, Any],
+    token: str | None = None,
+    *,
+    overrides: dict[str, str] | None = None,
+) -> dict[str, Any]:
     resolved = _resolve_susoft_settings(overrides)
-    token = _authenticate(overrides=overrides)
+    auth_token = token or _authenticate(overrides=overrides)
     # Use shopping cart endpoint so order is not finalized by integration and can continue in POS.
     url = f"{resolved['base_url']}/shopping-cart"
     headers = _base_headers(overrides=overrides)
-    headers["Authorization"] = f"Bearer {token}"
+    headers["Authorization"] = f"Bearer {auth_token}"
 
     try:
         response = requests.post(url, headers=headers, json=order_payload, timeout=int(resolved["timeout"]))
@@ -79,7 +84,7 @@ def create_order(order_payload: dict[str, Any], *, overrides: dict[str, str] | N
     if response.status_code == 409:
         ext_id = str(order_payload.get("externalRef", "")).strip()
         if ext_id:
-            existing = find_cart_by_external_id(ext_id, token)
+            existing = find_cart_by_external_id(ext_id, auth_token, overrides=overrides)
             if existing is not None:
                 return existing
 
