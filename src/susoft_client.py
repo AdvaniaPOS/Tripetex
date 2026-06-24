@@ -1,10 +1,62 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import requests
 
 from src.config import get_settings
+
+
+RATE_LIMIT_MAX_RETRIES = 3
+RATE_LIMIT_DEFAULT_BACKOFF_SECONDS = 1.0
+
+
+def _retry_after_seconds(response: requests.Response, attempt: int) -> float:
+    retry_after = response.headers.get("Retry-After") if response.headers is not None else None
+    if retry_after:
+        try:
+            parsed = float(str(retry_after).strip())
+            if parsed > 0:
+                return parsed
+        except Exception:
+            pass
+    # Linear backoff with a small default keeps behavior predictable for ops.
+    return RATE_LIMIT_DEFAULT_BACKOFF_SECONDS * float(attempt)
+
+
+def _request_with_rate_limit_retry(
+    method: str,
+    url: str,
+    *,
+    timeout: int,
+    headers: dict[str, str],
+    json_body: dict[str, Any] | None = None,
+    params: dict[str, Any] | None = None,
+) -> requests.Response:
+    last_response: requests.Response | None = None
+    for attempt in range(1, RATE_LIMIT_MAX_RETRIES + 1):
+        response = requests.request(
+            method,
+            url,
+            headers=headers,
+            json=json_body,
+            params=params,
+            timeout=timeout,
+        )
+        if response.status_code != 429:
+            return response
+
+        last_response = response
+        if attempt >= RATE_LIMIT_MAX_RETRIES:
+            return response
+
+        time.sleep(_retry_after_seconds(response, attempt))
+
+    # Defensive fallback; the loop always returns.
+    if last_response is not None:
+        return last_response
+    raise RuntimeError("Uventet feil i rate-limit retry-logikk mot Susoft API")
 
 
 def _resolve_susoft_settings(overrides: dict[str, str] | None = None) -> dict[str, str]:
@@ -43,7 +95,13 @@ def _authenticate(*, overrides: dict[str, str] | None = None) -> str:
     headers = _base_headers(overrides=overrides)
 
     try:
-        response = requests.post(url, headers=headers, json=body, timeout=int(resolved["timeout"]))
+        response = _request_with_rate_limit_retry(
+            "POST",
+            url,
+            timeout=int(resolved["timeout"]),
+            headers=headers,
+            json_body=body,
+        )
     except requests.RequestException as exc:
         raise RuntimeError(f"Nettverksfeil ved auth mot Susoft: {exc}") from exc
 
@@ -75,7 +133,13 @@ def create_order(
     headers["Authorization"] = f"Bearer {auth_token}"
 
     try:
-        response = requests.post(url, headers=headers, json=order_payload, timeout=int(resolved["timeout"]))
+        response = _request_with_rate_limit_retry(
+            "POST",
+            url,
+            timeout=int(resolved["timeout"]),
+            headers=headers,
+            json_body=order_payload,
+        )
     except requests.RequestException as exc:
         raise RuntimeError(f"Nettverksfeil ved opprettelse av Susoft-ordre: {exc}") from exc
 
