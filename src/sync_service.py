@@ -255,13 +255,33 @@ def process_susoft_payment_for_tenant(
         tenant = _get_tenant_or_raise(session, tenant_key)
         susoft_overrides = _susoft_overrides_for_tenant(tenant)
         tripletex_overrides = _tripletex_overrides_for_tenant(tenant)
-        row = _find_order_sync_by_susoft_uuid(session, tenant.id, susoft_uuid)
-        if row is None:
-            raise RuntimeError(f"Fant ingen lokal ordre for Susoft UUID {susoft_uuid}")
-
         token = susoft_authenticate(overrides=susoft_overrides)
         order = find_order_by_uuid(susoft_uuid, token=token, overrides=susoft_overrides)
         cart = find_cart_by_uuid(susoft_uuid, token=token, overrides=susoft_overrides)
+
+        row = _find_order_sync_by_susoft_uuid(session, tenant.id, susoft_uuid)
+        if row is None:
+            tt_candidate = None
+            if isinstance(order, dict):
+                alt = order.get("alternativeId")
+                tt_candidate = str(alt).strip() if alt is not None else None
+
+            if not tt_candidate and isinstance(cart, dict):
+                ext = cart.get("externalRef")
+                tt_candidate = str(ext).strip() if ext is not None else None
+
+            if tt_candidate:
+                row = _find_order_sync_by_tripletex_order_id(session, tenant.id, tt_candidate)
+                if row is not None and not row.susoft_uuid:
+                    row.susoft_uuid = susoft_uuid
+                    row.updated_at = datetime.now(UTC)
+
+        if row is None:
+            raise RuntimeError(
+                f"Fant ingen lokal ordre for Susoft UUID {susoft_uuid} "
+                f"(alternativeId={order.get('alternativeId') if isinstance(order, dict) else None}, "
+                f"externalRef={cart.get('externalRef') if isinstance(cart, dict) else None})"
+            )
 
         if order is None:
             _add_event(
@@ -311,7 +331,10 @@ def process_susoft_payment_for_tenant(
             }
 
         tt_order_id_raw = order.get("alternativeId")
-        tt_order_id = int(str(tt_order_id_raw)) if tt_order_id_raw is not None else None
+        try:
+            tt_order_id = int(str(tt_order_id_raw)) if tt_order_id_raw is not None else None
+        except (TypeError, ValueError):
+            tt_order_id = None
         if tt_order_id is None:
             row.status = "TT_PAYMENT_FAILED"
             row.last_error = "Susoft order mangler alternativeId mot TT order id"
