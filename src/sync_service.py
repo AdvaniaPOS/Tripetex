@@ -1,21 +1,26 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from collections import defaultdict
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from src.db import db_session
-from src.models import JobRun, OrderSync, SyncEvent, Tenant
+from src.config import get_settings
+from src.models import ArticleIncomeMapping, DirectSalesSettlementRun, JobRun, OrderSync, SyncEvent, Tenant
 from src.susoft_client import (
     authenticate as susoft_authenticate,
     create_order as create_susoft_order,
     find_cart_by_uuid,
     find_order_by_uuid,
+    list_orders_by_date_range,
 )
 from src.tripletex_client import create_session_token, fetch_open_orders
+from src.tripletex_client import create_ledger_voucher, find_voucher_by_external_number, resolve_account_ids_by_number
 from tripletex_invoice_payment_flow import (
     AlreadyInvoicedError,
     build_basic_headers,
@@ -27,6 +32,7 @@ from tripletex_invoice_payment_flow import (
 TRIPLETEX_TO_SUSOFT_PRODUCT_ID_MAP: dict[str, str] = {
     "69775686": "10002",  # Susoft M10
 }
+DEFAULT_DIRECT_SALES_SETTLEMENT_MODE = "FINANCIAL"
 
 
 def _add_event(
@@ -94,6 +100,215 @@ def _safe_float(value: Any) -> float:
         return float(str(value))
     except Exception:
         return 0.0
+
+
+def _parse_datetime_any(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    normalized = text.replace("Z", "+00:00")
+    candidates = [normalized]
+    if " " in normalized and "T" not in normalized:
+        candidates.append(normalized.replace(" ", "T", 1))
+    for candidate in candidates:
+        try:
+            dt = datetime.fromisoformat(candidate)
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=UTC)
+            return dt.astimezone(UTC)
+        except Exception:
+            continue
+    return None
+
+
+def _is_tt_linked_susoft_order(order: dict[str, Any]) -> bool:
+    for key in ("alternativeId", "externalRef"):
+        value = order.get(key)
+        if value is not None and str(value).strip():
+            return True
+    return False
+
+
+def _settlement_day_paid_amount(order: dict[str, Any], settlement_date: date, *, timezone_name: str) -> float:
+    payments = order.get("payments") if isinstance(order.get("payments"), list) else []
+    tz = ZoneInfo(timezone_name)
+    total = 0.0
+    for payment in payments:
+        if not isinstance(payment, dict):
+            continue
+        payment_dt = (
+            _parse_datetime_any(payment.get("paymentDateTime"))
+            or _parse_datetime_any(payment.get("paymentDate"))
+            or _parse_datetime_any(payment.get("created"))
+            or _parse_datetime_any(payment.get("updated"))
+        )
+        if payment_dt is None:
+            continue
+        if payment_dt.astimezone(tz).date() != settlement_date:
+            continue
+        total += _safe_float(payment.get("amount"))
+    return total
+
+
+def _extract_order_line_amount_incl_vat(line: dict[str, Any]) -> float:
+    amount_candidates = [
+        line.get("amountIncludingVat"),
+        line.get("amountIncludingVatCurrency"),
+        line.get("amountInclTax"),
+        line.get("lineTotalIncludingVat"),
+        line.get("lineTotalInclTax"),
+        line.get("totalIncludingVat"),
+    ]
+    for candidate in amount_candidates:
+        amount = _safe_float(candidate)
+        if amount > 0:
+            return amount
+
+    qty = _safe_float(line.get("qty") or line.get("quantity") or line.get("count"))
+    unit_candidates = [
+        line.get("salesPriceInclTax"),
+        line.get("unitPriceIncludingVatCurrency"),
+        line.get("unitPriceIncludingVat"),
+        line.get("priceInclTax"),
+    ]
+    for candidate in unit_candidates:
+        unit = _safe_float(candidate)
+        if unit > 0 and qty > 0:
+            return unit * qty
+    return 0.0
+
+
+def _extract_order_line_product(line: dict[str, Any]) -> tuple[str, str | None]:
+    product = line.get("product") if isinstance(line.get("product"), dict) else None
+    if product is not None:
+        product_id_raw = product.get("id") or product.get("number")
+        product_name_raw = product.get("name")
+    else:
+        product_id_raw = line.get("productId") or line.get("articleId") or line.get("itemId")
+        product_name_raw = line.get("productName") or line.get("articleName") or line.get("itemName")
+
+    product_id = str(product_id_raw).strip() if product_id_raw is not None else ""
+    product_name = str(product_name_raw).strip() if product_name_raw is not None else None
+    return product_id, product_name or None
+
+
+def _build_settlement_external_voucher_number(tenant_key: str, settlement_date: date) -> str:
+    return f"DS-{tenant_key}-{settlement_date.isoformat()}"
+
+
+def _post_direct_sales_settlement_to_tripletex(
+    *,
+    tenant: Tenant,
+    settlement_date: date,
+    account_lines: list[dict[str, Any]],
+    offset_account: str,
+    tripletex_overrides: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    external_number = _build_settlement_external_voucher_number(tenant.tenant_key, settlement_date)
+    session_token = create_session_token(overrides=tripletex_overrides)
+
+    existing = find_voucher_by_external_number(
+        session_token,
+        external_voucher_number=external_number,
+        overrides=tripletex_overrides,
+    )
+    if existing is not None:
+        return {
+            "created": False,
+            "voucher_id": existing.get("id"),
+            "voucher_number": existing.get("number"),
+            "external_voucher_number": external_number,
+            "message": "Voucher finnes allerede (idempotent oppslag)",
+        }
+
+    credit_lines = [
+        {
+            "income_account": str(line.get("income_account") or "").strip(),
+            "amount": round(_safe_float(line.get("amount")), 2),
+        }
+        for line in account_lines
+    ]
+    credit_lines = [line for line in credit_lines if line["income_account"] and line["amount"] > 0]
+    if not credit_lines:
+        raise RuntimeError("Ingen gyldige account_lines for posting")
+
+    account_numbers = [line["income_account"] for line in credit_lines] + [offset_account]
+    account_id_by_number = resolve_account_ids_by_number(
+        session_token,
+        account_numbers=account_numbers,
+        overrides=tripletex_overrides,
+    )
+
+    voucher_postings: list[dict[str, Any]] = []
+    total_credit = 0.0
+    for line in credit_lines:
+        amount = round(line["amount"], 2)
+        if amount <= 0:
+            continue
+        total_credit += amount
+        voucher_postings.append(
+            {
+                "account_id": account_id_by_number[line["income_account"]],
+                "amount": -amount,
+                "description": f"Direktesalg oppgjor {settlement_date.isoformat()} konto {line['income_account']}",
+            }
+        )
+
+    voucher_postings.append(
+        {
+            "account_id": account_id_by_number[offset_account],
+            "amount": round(total_credit, 2),
+            "description": f"Direktesalg oppgjor {settlement_date.isoformat()} motkonto {offset_account}",
+        }
+    )
+
+    voucher = create_ledger_voucher(
+        session_token,
+        voucher_date=settlement_date.isoformat(),
+        description=f"Direktesalg oppgjor {tenant.tenant_key} {settlement_date.isoformat()}",
+        external_voucher_number=external_number,
+        postings=voucher_postings,
+        send_to_ledger=True,
+        overrides=tripletex_overrides,
+    )
+    return {
+        "created": True,
+        "voucher_id": voucher.get("id"),
+        "voucher_number": voucher.get("number"),
+        "external_voucher_number": external_number,
+        "message": "Voucher opprettet i Tripletex",
+    }
+
+
+def _upsert_direct_sales_settlement_run(
+    session: Session,
+    *,
+    tenant_id: int,
+    settlement_date: date,
+) -> DirectSalesSettlementRun:
+    existing = session.scalar(
+        select(DirectSalesSettlementRun).where(
+            DirectSalesSettlementRun.tenant_id == tenant_id,
+            DirectSalesSettlementRun.settlement_date == settlement_date,
+        )
+    )
+    if existing is None:
+        created = DirectSalesSettlementRun(
+            tenant_id=tenant_id,
+            settlement_date=settlement_date,
+            status="RUNNING",
+            started_at=datetime.now(UTC),
+        )
+        session.add(created)
+        session.flush()
+        return created
+    existing.status = "RUNNING"
+    existing.started_at = datetime.now(UTC)
+    existing.finished_at = None
+    session.flush()
+    return existing
 
 
 def _is_tripletex_order_open(order_payload: dict[str, Any]) -> bool:
@@ -1143,4 +1358,246 @@ def sync_paid_orders_to_tripletex_for_tenant(
             "skipped": skipped,
             "errors": errors,
             "message": job.message,
+        }
+
+
+def calculate_direct_sales_settlement_for_tenant(
+    tenant_key: str,
+    *,
+    settlement_date: date | None = None,
+    execute: bool = False,
+) -> dict[str, Any]:
+    settings = get_settings()
+    tz_name = settings.tripletex_timezone
+    target_date = settlement_date or datetime.now(ZoneInfo(tz_name)).date() - timedelta(days=1)
+    from_dt = f"{target_date.isoformat()}T00:00:00+00:00"
+    to_dt = f"{(target_date + timedelta(days=1)).isoformat()}T00:00:00+00:00"
+
+    with db_session() as session:
+        tenant = session.scalar(select(Tenant).where(Tenant.tenant_key == tenant_key))
+        if tenant is None:
+            raise RuntimeError(f"Tenant finnes ikke: {tenant_key}")
+        if not tenant.active:
+            raise RuntimeError(f"Tenant er inaktiv: {tenant_key}")
+
+        run = _upsert_direct_sales_settlement_run(
+            session,
+            tenant_id=tenant.id,
+            settlement_date=target_date,
+        )
+
+        direct_sales_gross = 0.0
+        tt_linked_gross = 0.0
+        net_transfer_gross = 0.0
+        direct_paid_orders = 0
+        tt_linked_paid_orders = 0
+        account_amounts: dict[str, float] = defaultdict(float)
+        unresolved_products: dict[str, dict[str, Any]] = {}
+
+        try:
+            token = susoft_authenticate(overrides=_susoft_overrides_for_tenant(tenant))
+            orders = list_orders_by_date_range(
+                from_date=from_dt,
+                to_date=to_dt,
+                mode=DEFAULT_DIRECT_SALES_SETTLEMENT_MODE,
+                token=token,
+                overrides=_susoft_overrides_for_tenant(tenant),
+            )
+            default_income_account = str(tenant.direct_sales_default_income_account or "").strip() or None
+            mapping_rows = session.scalars(
+                select(ArticleIncomeMapping)
+                .where(
+                    ArticleIncomeMapping.tenant_id == tenant.id,
+                    ArticleIncomeMapping.active.is_(True),
+                )
+                .order_by(ArticleIncomeMapping.id.asc())
+            ).all()
+            mapping_by_product_id = {
+                str(row.susoft_product_id).strip(): row
+                for row in mapping_rows
+                if str(row.susoft_product_id).strip()
+            }
+
+            for order in orders:
+                if not isinstance(order, dict):
+                    continue
+                paid_amount = _settlement_day_paid_amount(order, target_date, timezone_name=tz_name)
+                if paid_amount <= 0:
+                    continue
+
+                if _is_tt_linked_susoft_order(order):
+                    tt_linked_gross += paid_amount
+                    tt_linked_paid_orders += 1
+                else:
+                    direct_sales_gross += paid_amount
+                    direct_paid_orders += 1
+
+                    line_items: list[tuple[str, str | None, float]] = []
+                    raw_lines = order.get("lines") if isinstance(order.get("lines"), list) else []
+                    for raw_line in raw_lines:
+                        if not isinstance(raw_line, dict):
+                            continue
+                        product_id, product_name = _extract_order_line_product(raw_line)
+                        line_amount = _extract_order_line_amount_incl_vat(raw_line)
+                        if not product_id or line_amount <= 0:
+                            continue
+                        line_items.append((product_id, product_name, line_amount))
+
+                    order_lines_total = sum(item[2] for item in line_items)
+                    if order_lines_total <= 0:
+                        unresolved = unresolved_products.setdefault(
+                            "__ORDER_TOTAL_UNKNOWN__",
+                            {
+                                "susoft_product_id": "__ORDER_TOTAL_UNKNOWN__",
+                                "susoft_product_name": "Order without line totals",
+                                "amount": 0.0,
+                                "count": 0,
+                            },
+                        )
+                        unresolved["amount"] = round(float(unresolved["amount"]) + paid_amount, 2)
+                        unresolved["count"] = int(unresolved["count"]) + 1
+                        continue
+
+                    for product_id, product_name, line_total in line_items:
+                        allocated_amount = paid_amount * (line_total / order_lines_total)
+                        mapping = mapping_by_product_id.get(product_id)
+                        account = (
+                            str(mapping.income_account).strip()
+                            if mapping is not None and mapping.income_account is not None and str(mapping.income_account).strip()
+                            else default_income_account
+                        )
+                        if account:
+                            account_amounts[account] += allocated_amount
+                        else:
+                            unresolved = unresolved_products.setdefault(
+                                product_id,
+                                {
+                                    "susoft_product_id": product_id,
+                                    "susoft_product_name": product_name,
+                                    "amount": 0.0,
+                                    "count": 0,
+                                },
+                            )
+                            unresolved["amount"] = round(float(unresolved["amount"]) + allocated_amount, 2)
+                            unresolved["count"] = int(unresolved["count"]) + 1
+
+            net_transfer_gross = max(0.0, direct_sales_gross - tt_linked_gross)
+            account_lines = [
+                {"income_account": account, "amount": round(amount, 2)}
+                for account, amount in sorted(account_amounts.items())
+                if round(amount, 2) != 0
+            ]
+            unresolved_list = sorted(
+                [
+                    {
+                        "susoft_product_id": str(item["susoft_product_id"]),
+                        "susoft_product_name": item.get("susoft_product_name"),
+                        "amount": round(_safe_float(item.get("amount")), 2),
+                        "count": int(item.get("count") or 0),
+                    }
+                    for item in unresolved_products.values()
+                ],
+                key=lambda row: (row["susoft_product_id"], row["susoft_product_name"] or ""),
+            )
+
+            if not execute:
+                run.status = "PREVIEW"
+            elif net_transfer_gross <= 0:
+                run.status = "NOOP"
+            elif unresolved_list:
+                run.status = "MAPPING_MISSING"
+            else:
+                run.status = "READY_FOR_POSTING"
+            run.direct_sales_gross = round(direct_sales_gross, 2)
+            run.tt_linked_gross = round(tt_linked_gross, 2)
+            run.net_transfer_gross = round(net_transfer_gross, 2)
+            run.lines_count = len(account_lines)
+            if run.status == "NOOP":
+                run.message = "Ingen netto differanse for datoen."
+            elif run.status == "MAPPING_MISSING":
+                run.message = "Mangler inntektskonto-mapping for en eller flere artikler."
+            elif run.status == "READY_FOR_POSTING":
+                run.message = "Klar for posting i Tripletex."
+            else:
+                run.message = "Preview beregnet uten posting."
+
+            posting_result: dict[str, Any] | None = None
+            offset_account = str(tenant.direct_sales_settlement_offset_account or "1900").strip() or "1900"
+            if execute and run.status == "READY_FOR_POSTING":
+                posting_result = _post_direct_sales_settlement_to_tripletex(
+                    tenant=tenant,
+                    settlement_date=target_date,
+                    account_lines=account_lines,
+                    offset_account=offset_account,
+                    tripletex_overrides=_tripletex_overrides_for_tenant(tenant),
+                )
+                run.status = "POSTED"
+                run.posted_voucher_id = str(posting_result.get("voucher_id") or "") or None
+                run.message = str(posting_result.get("message") or "Direktesalg oppgjor postert")
+
+            run.details_json = json.dumps(
+                {
+                    "from": from_dt,
+                    "to": to_dt,
+                    "direct_paid_orders": direct_paid_orders,
+                    "tt_linked_paid_orders": tt_linked_paid_orders,
+                    "default_income_account": default_income_account,
+                    "offset_account": offset_account,
+                    "account_lines": account_lines,
+                    "unresolved_products": unresolved_list,
+                    "posting_result": posting_result,
+                },
+                ensure_ascii=False,
+            )
+            run.finished_at = datetime.now(UTC)
+
+            _add_event(
+                session,
+                tenant_id=tenant.id,
+                event_type="DIRECT_SALES_SETTLEMENT_CALCULATED",
+                message="Direktesalg dagsoppgjor beregnet",
+                level="INFO",
+                details={
+                    "settlement_date": target_date.isoformat(),
+                    "direct_sales_gross": run.direct_sales_gross,
+                    "tt_linked_gross": run.tt_linked_gross,
+                    "net_transfer_gross": run.net_transfer_gross,
+                    "account_lines": account_lines,
+                    "unresolved_products": unresolved_list,
+                    "offset_account": offset_account,
+                    "posted_voucher_id": run.posted_voucher_id,
+                    "execute": execute,
+                },
+            )
+            session.commit()
+        except Exception as exc:
+            run.status = "FAILED"
+            run.message = str(exc)
+            run.finished_at = datetime.now(UTC)
+            _add_event(
+                session,
+                tenant_id=tenant.id,
+                event_type="DIRECT_SALES_SETTLEMENT_FAILED",
+                message="Direktesalg dagsoppgjor feilet",
+                level="ERROR",
+                details={"settlement_date": target_date.isoformat(), "error": str(exc)},
+            )
+            session.commit()
+            raise
+
+        return {
+            "tenant_key": tenant_key,
+            "settlement_date": target_date.isoformat(),
+            "run_id": run.id,
+            "status": run.status,
+            "direct_sales_gross": run.direct_sales_gross,
+            "tt_linked_gross": run.tt_linked_gross,
+            "net_transfer_gross": run.net_transfer_gross,
+            "direct_paid_orders": direct_paid_orders,
+            "tt_linked_paid_orders": tt_linked_paid_orders,
+            "account_lines": account_lines,
+            "unresolved_products": unresolved_list,
+            "offset_account": str(tenant.direct_sales_settlement_offset_account or "1900").strip() or "1900",
+            "posted_voucher_id": run.posted_voucher_id,
+            "message": run.message,
         }

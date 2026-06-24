@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+from datetime import date
 from datetime import UTC, datetime
 import json
 
 from src.db import db_session, init_db
 from src.models import JobRun, Tenant
 from src.sync_service import (
+    calculate_direct_sales_settlement_for_tenant,
     get_sendable_orders_for_tenant,
     retry_failed_orders_for_tenant,
     run_manual_sync_for_tenant,
@@ -104,6 +106,16 @@ def cmd_list_sendable(args: argparse.Namespace) -> None:
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
+def cmd_direct_sales_settlement(args: argparse.Namespace) -> None:
+    parsed_date = date.fromisoformat(args.settlement_date) if args.settlement_date else None
+    result = calculate_direct_sales_settlement_for_tenant(
+        args.tenant_key,
+        settlement_date=parsed_date,
+        execute=args.execute,
+    )
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Local admin commands for TT-Susoft sync service")
     sub = parser.add_subparsers(required=True)
@@ -158,6 +170,15 @@ def build_parser() -> argparse.ArgumentParser:
     sendable_parser.add_argument("--tenant-key", required=True)
     sendable_parser.add_argument("--limit", type=int, default=50)
     sendable_parser.set_defaults(func=cmd_list_sendable)
+
+    settlement_parser = sub.add_parser(
+        "direct-sales-settlement",
+        help="Calculate daily direct-sales settlement (preview by default)",
+    )
+    settlement_parser.add_argument("--tenant-key", required=True)
+    settlement_parser.add_argument("--settlement-date", default=None, help="YYYY-MM-DD (default: yesterday in business timezone)")
+    settlement_parser.add_argument("--execute", action="store_true", help="Mark run as execute (posting implementation pending)")
+    settlement_parser.set_defaults(func=cmd_direct_sales_settlement)
 
     return parser
 

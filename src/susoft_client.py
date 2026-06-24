@@ -362,3 +362,41 @@ def add_webhook(
     if not isinstance(payload, dict):
         raise RuntimeError("Ugyldig responsformat ved oppretting av Susoft-webhook.")
     return payload
+
+
+def list_orders_by_date_range(
+    *,
+    from_date: str,
+    to_date: str,
+    mode: str = "FINANCIAL",
+    token: str | None = None,
+    overrides: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    resolved = _resolve_susoft_settings(overrides)
+    auth_token = token or _authenticate(overrides=overrides)
+    url = f"{resolved['base_url']}/order/list"
+
+    headers = _base_headers(overrides=overrides)
+    headers["Authorization"] = f"Bearer {auth_token}"
+    params = {
+        "fromDate": from_date,
+        "toDate": to_date,
+        "mode": mode,
+    }
+
+    try:
+        response = _request_with_rate_limit_retry(
+            "GET",
+            url,
+            timeout=int(resolved["timeout"]),
+            headers=headers,
+            params=params,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Nettverksfeil ved henting av Susoft ordre-liste: {exc}") from exc
+
+    if not response.ok:
+        raise RuntimeError(f"Susoft order/list feilet med status {response.status_code}: {response.text}")
+
+    payload = response.json()
+    return payload if isinstance(payload, list) else []

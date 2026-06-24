@@ -33,6 +33,10 @@ def _ensure_schema_compatibility() -> None:
         "susoft_password": "TEXT",
         "auto_paid_sync_enabled": "BOOLEAN DEFAULT TRUE",
         "auto_paid_sync_interval_minutes": "INTEGER DEFAULT 1",
+        "daily_direct_sales_sync_enabled": "BOOLEAN DEFAULT FALSE",
+        "daily_direct_sales_sync_time": "VARCHAR(5) DEFAULT '23:00'",
+        "direct_sales_default_income_account": "VARCHAR(20)",
+        "direct_sales_settlement_offset_account": "VARCHAR(20) DEFAULT '1900'",
     }
 
     with engine.begin() as conn:

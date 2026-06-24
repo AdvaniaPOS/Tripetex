@@ -3,8 +3,9 @@ from __future__ import annotations
 import secrets
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.responses import HTMLResponse
@@ -13,11 +14,12 @@ from sqlalchemy import desc, func, select
 from src.auth import require_dashboard_auth
 from src.config import get_settings
 from src.db import db_health_check, db_session, init_db
-from src.models import JobRun, OrderSync, SyncEvent, Tenant
+from src.models import ArticleIncomeMapping, DirectSalesSettlementRun, JobRun, OrderSync, SyncEvent, Tenant
 from src.susoft_client import add_webhook as add_susoft_webhook
 from src.susoft_client import authenticate as authenticate_susoft
 from src.susoft_client import list_webhooks as list_susoft_webhooks
 from src.sync_service import (
+    calculate_direct_sales_settlement_for_tenant,
     get_sendable_orders_for_tenant,
     process_susoft_payment_for_tenant,
     process_tripletex_order_by_id_for_tenant,
@@ -33,6 +35,7 @@ app = FastAPI(title=settings.app_name)
 AUTO_PAID_SYNC_MIN_INTERVAL_MINUTES = 1
 AUTO_PAID_SYNC_MAX_INTERVAL_MINUTES = 1440
 AUTO_PAID_SYNC_TICK_SECONDS = 5
+DIRECT_SALES_SETTLEMENT_TICK_SECONDS = 30
 
 
 def _require_webhook_secret(x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret")) -> None:
@@ -95,6 +98,20 @@ def _clamp_auto_paid_sync_interval_minutes(raw_value: object, *, default: int = 
     return max(AUTO_PAID_SYNC_MIN_INTERVAL_MINUTES, min(AUTO_PAID_SYNC_MAX_INTERVAL_MINUTES, value))
 
 
+def _normalize_hhmm(raw_value: object, *, default: str = "23:00") -> str:
+    value = str(raw_value or "").strip()
+    if len(value) != 5 or value[2] != ":":
+        return default
+    hh, mm = value.split(":", 1)
+    if not (hh.isdigit() and mm.isdigit()):
+        return default
+    hour = int(hh)
+    minute = int(mm)
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return default
+    return f"{hour:02d}:{minute:02d}"
+
+
 def _run_auto_paid_sync_worker(stop_event: threading.Event) -> None:
     next_run_by_tenant: dict[str, float] = {}
     while not stop_event.wait(AUTO_PAID_SYNC_TICK_SECONDS):
@@ -135,6 +152,55 @@ def _run_auto_paid_sync_worker(stop_event: threading.Event) -> None:
                 )
             except Exception:
                 # Keep the scheduler resilient; operational details are captured as sync events.
+                continue
+
+
+def _run_daily_direct_sales_settlement_worker(stop_event: threading.Event) -> None:
+    next_run_by_tenant: dict[str, float] = {}
+    while not stop_event.wait(DIRECT_SALES_SETTLEMENT_TICK_SECONDS):
+        try:
+            with db_session() as session:
+                tenants = session.scalars(
+                    select(Tenant)
+                    .where(
+                        Tenant.active.is_(True),
+                        Tenant.daily_direct_sales_sync_enabled.is_(True),
+                    )
+                    .order_by(Tenant.id.asc())
+                ).all()
+        except Exception:
+            continue
+
+        now_utc = datetime.now(UTC)
+        active_keys = {tenant.tenant_key for tenant in tenants}
+        for key in list(next_run_by_tenant.keys()):
+            if key not in active_keys:
+                next_run_by_tenant.pop(key, None)
+
+        for tenant in tenants:
+            time_value = _normalize_hhmm(tenant.daily_direct_sales_sync_time, default="23:00")
+            hh, mm = time_value.split(":", 1)
+            target_hour = int(hh)
+            target_minute = int(mm)
+            tz_name = get_settings().tripletex_timezone
+            local_now = now_utc.astimezone(ZoneInfo(tz_name))
+            target_local = local_now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
+            if local_now < target_local:
+                target_local = target_local - timedelta(days=1)
+            settlement_date = target_local.date()
+
+            gate_key = f"{tenant.tenant_key}:{settlement_date.isoformat()}"
+            if gate_key in next_run_by_tenant and time.monotonic() < next_run_by_tenant[gate_key]:
+                continue
+            next_run_by_tenant[gate_key] = time.monotonic() + 3600.0
+
+            try:
+                calculate_direct_sales_settlement_for_tenant(
+                    tenant.tenant_key,
+                    settlement_date=settlement_date,
+                    execute=True,
+                )
+            except Exception:
                 continue
 
 
@@ -234,19 +300,30 @@ def on_startup() -> None:
 
     stop_event = threading.Event()
     worker = threading.Thread(target=_run_auto_paid_sync_worker, args=(stop_event,), daemon=True, name="auto-paid-sync-worker")
+    direct_sales_worker = threading.Thread(
+        target=_run_daily_direct_sales_settlement_worker,
+        args=(stop_event,),
+        daemon=True,
+        name="daily-direct-sales-settlement-worker",
+    )
     app.state.auto_paid_sync_stop_event = stop_event
     app.state.auto_paid_sync_worker = worker
+    app.state.daily_direct_sales_worker = direct_sales_worker
     worker.start()
+    direct_sales_worker.start()
 
 
 @app.on_event("shutdown")
 def on_shutdown() -> None:
     stop_event = getattr(app.state, "auto_paid_sync_stop_event", None)
     worker = getattr(app.state, "auto_paid_sync_worker", None)
+    direct_sales_worker = getattr(app.state, "daily_direct_sales_worker", None)
     if isinstance(stop_event, threading.Event):
         stop_event.set()
     if isinstance(worker, threading.Thread) and worker.is_alive():
         worker.join(timeout=3)
+    if isinstance(direct_sales_worker, threading.Thread) and direct_sales_worker.is_alive():
+        direct_sales_worker.join(timeout=3)
 
 
 @app.get("/health")
@@ -555,6 +632,25 @@ def api_upsert_tenant(payload: dict[str, object]) -> dict[str, object]:
             payload.get("auto_paid_sync_interval_minutes") if "auto_paid_sync_interval_minutes" in payload else payload.get("autoPaidSyncIntervalMinutes"),
             default=row.auto_paid_sync_interval_minutes if row.auto_paid_sync_interval_minutes is not None else 1,
         )
+        row.daily_direct_sales_sync_enabled = _to_bool(
+            payload.get("daily_direct_sales_sync_enabled") if "daily_direct_sales_sync_enabled" in payload else payload.get("dailyDirectSalesSyncEnabled"),
+            default=row.daily_direct_sales_sync_enabled if row.daily_direct_sales_sync_enabled is not None else False,
+        )
+        row.daily_direct_sales_sync_time = _normalize_hhmm(
+            payload.get("daily_direct_sales_sync_time") if "daily_direct_sales_sync_time" in payload else payload.get("dailyDirectSalesSyncTime"),
+            default=row.daily_direct_sales_sync_time or "23:00",
+        )
+        incoming_default_account = payload.get("direct_sales_default_income_account") if "direct_sales_default_income_account" in payload else payload.get("directSalesDefaultIncomeAccount")
+        row.direct_sales_default_income_account = _keep_or_replace_secret(
+            row.direct_sales_default_income_account,
+            str(incoming_default_account) if incoming_default_account is not None else None,
+        )
+        incoming_offset_account = payload.get("direct_sales_settlement_offset_account") if "direct_sales_settlement_offset_account" in payload else payload.get("directSalesSettlementOffsetAccount")
+        row.direct_sales_settlement_offset_account = (
+            str(incoming_offset_account).strip()
+            if incoming_offset_account is not None and str(incoming_offset_account).strip()
+            else (row.direct_sales_settlement_offset_account or "1900")
+        )
 
         session.commit()
         session.refresh(row)
@@ -566,6 +662,10 @@ def api_upsert_tenant(payload: dict[str, object]) -> dict[str, object]:
         "active": row.active,
         "auto_paid_sync_enabled": row.auto_paid_sync_enabled,
         "auto_paid_sync_interval_minutes": row.auto_paid_sync_interval_minutes,
+        "daily_direct_sales_sync_enabled": row.daily_direct_sales_sync_enabled,
+        "daily_direct_sales_sync_time": row.daily_direct_sales_sync_time,
+        "direct_sales_default_income_account": row.direct_sales_default_income_account,
+        "direct_sales_settlement_offset_account": row.direct_sales_settlement_offset_account,
         "has_tripletex_tokens": bool(row.tripletex_consumer_token and row.tripletex_employee_token),
         "has_susoft_credentials": bool(row.susoft_shop_url_key and row.susoft_username and row.susoft_password),
     }
@@ -584,6 +684,10 @@ def api_tenant_connections(tenant_key: str) -> dict[str, object]:
         "active": row.active,
         "auto_paid_sync_enabled": row.auto_paid_sync_enabled,
         "auto_paid_sync_interval_minutes": row.auto_paid_sync_interval_minutes,
+        "daily_direct_sales_sync_enabled": row.daily_direct_sales_sync_enabled,
+        "daily_direct_sales_sync_time": row.daily_direct_sales_sync_time,
+        "direct_sales_default_income_account": row.direct_sales_default_income_account,
+        "direct_sales_settlement_offset_account": row.direct_sales_settlement_offset_account,
         "tripletex_base_url": row.tripletex_base_url or settings.tripletex_base_url,
         "susoft_base_url": row.susoft_base_url or settings.susoft_base_url,
         "has_tripletex_tokens": bool(row.tripletex_consumer_token and row.tripletex_employee_token),
@@ -613,6 +717,10 @@ def api_tenants() -> list[dict[str, object]]:
             "active": row.active,
             "auto_paid_sync_enabled": row.auto_paid_sync_enabled,
             "auto_paid_sync_interval_minutes": row.auto_paid_sync_interval_minutes,
+            "daily_direct_sales_sync_enabled": row.daily_direct_sales_sync_enabled,
+            "daily_direct_sales_sync_time": row.daily_direct_sales_sync_time,
+            "direct_sales_default_income_account": row.direct_sales_default_income_account,
+            "direct_sales_settlement_offset_account": row.direct_sales_settlement_offset_account,
             "has_tripletex_tokens": bool(row.tripletex_consumer_token and row.tripletex_employee_token),
             "has_susoft_credentials": bool(row.susoft_shop_url_key and row.susoft_username and row.susoft_password),
             "created_at": row.created_at.isoformat(),
@@ -673,6 +781,154 @@ def api_events(tenant_key: str, limit: int = Query(default=100, ge=1, le=500)) -
             "message": row.message,
             "details_json": row.details_json,
             "created_at": row.created_at.isoformat(),
+        }
+        for row in rows
+    ]
+
+
+@app.get("/api/tenants/{tenant_key}/article-income-mappings", dependencies=[Depends(require_dashboard_auth)])
+def api_article_income_mappings(tenant_key: str) -> list[dict[str, object]]:
+    with db_session() as session:
+        tenant = session.scalar(select(Tenant).where(Tenant.tenant_key == tenant_key))
+        if tenant is None:
+            return []
+
+        rows = session.scalars(
+            select(ArticleIncomeMapping)
+            .where(ArticleIncomeMapping.tenant_id == tenant.id)
+            .order_by(ArticleIncomeMapping.active.desc(), ArticleIncomeMapping.susoft_product_id.asc(), ArticleIncomeMapping.id.asc())
+        ).all()
+
+    return [
+        {
+            "id": row.id,
+            "susoft_product_id": row.susoft_product_id,
+            "susoft_product_name": row.susoft_product_name,
+            "tripletex_product_id": row.tripletex_product_id,
+            "income_account": row.income_account,
+            "source": row.source,
+            "active": row.active,
+            "created_at": row.created_at.isoformat(),
+            "updated_at": row.updated_at.isoformat(),
+        }
+        for row in rows
+    ]
+
+
+@app.post("/api/tenants/{tenant_key}/article-income-mappings", dependencies=[Depends(require_dashboard_auth)])
+def api_upsert_article_income_mapping(tenant_key: str, payload: dict[str, object]) -> dict[str, object]:
+    susoft_product_id = str(payload.get("susoft_product_id") or payload.get("susoftProductId") or "").strip()
+    if not susoft_product_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="susoft_product_id mangler")
+
+    with db_session() as session:
+        tenant = session.scalar(select(Tenant).where(Tenant.tenant_key == tenant_key))
+        if tenant is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant finnes ikke")
+
+        row = session.scalar(
+            select(ArticleIncomeMapping).where(
+                ArticleIncomeMapping.tenant_id == tenant.id,
+                ArticleIncomeMapping.susoft_product_id == susoft_product_id,
+            )
+        )
+        if row is None:
+            row = ArticleIncomeMapping(
+                tenant_id=tenant.id,
+                susoft_product_id=susoft_product_id,
+                source="MANUAL",
+                active=True,
+            )
+            session.add(row)
+            session.flush()
+
+        row.susoft_product_name = str(payload.get("susoft_product_name") or payload.get("susoftProductName") or row.susoft_product_name or "").strip() or None
+        row.tripletex_product_id = str(payload.get("tripletex_product_id") or payload.get("tripletexProductId") or row.tripletex_product_id or "").strip() or None
+        row.income_account = str(payload.get("income_account") or payload.get("incomeAccount") or row.income_account or "").strip() or None
+        row.active = _to_bool(payload.get("active"), default=row.active if row.active is not None else True)
+        row.source = str(payload.get("source") or row.source or "MANUAL").strip() or "MANUAL"
+        row.updated_at = datetime.now(UTC)
+
+        session.commit()
+        session.refresh(row)
+
+    return {
+        "id": row.id,
+        "susoft_product_id": row.susoft_product_id,
+        "susoft_product_name": row.susoft_product_name,
+        "tripletex_product_id": row.tripletex_product_id,
+        "income_account": row.income_account,
+        "source": row.source,
+        "active": row.active,
+        "created_at": row.created_at.isoformat(),
+        "updated_at": row.updated_at.isoformat(),
+    }
+
+
+@app.delete("/api/tenants/{tenant_key}/article-income-mappings/{mapping_id}", dependencies=[Depends(require_dashboard_auth)])
+def api_delete_article_income_mapping(tenant_key: str, mapping_id: int) -> dict[str, object]:
+    with db_session() as session:
+        tenant = session.scalar(select(Tenant).where(Tenant.tenant_key == tenant_key))
+        if tenant is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant finnes ikke")
+
+        row = session.scalar(
+            select(ArticleIncomeMapping).where(
+                ArticleIncomeMapping.id == mapping_id,
+                ArticleIncomeMapping.tenant_id == tenant.id,
+            )
+        )
+        if row is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mapping finnes ikke")
+
+        session.delete(row)
+        session.commit()
+
+    return {"deleted": True, "id": mapping_id}
+
+
+@app.post("/api/tenants/{tenant_key}/settlement/direct-sales", dependencies=[Depends(require_dashboard_auth)])
+def api_direct_sales_settlement_run(
+    tenant_key: str,
+    settlement_date: str | None = Query(default=None),
+    execute: bool = Query(default=False),
+) -> dict[str, object]:
+    parsed_date = date.fromisoformat(settlement_date) if settlement_date else None
+    result = calculate_direct_sales_settlement_for_tenant(
+        tenant_key,
+        settlement_date=parsed_date,
+        execute=execute,
+    )
+    return result
+
+
+@app.get("/api/tenants/{tenant_key}/settlement/direct-sales/runs", dependencies=[Depends(require_dashboard_auth)])
+def api_direct_sales_settlement_runs(tenant_key: str, limit: int = Query(default=30, ge=1, le=365)) -> list[dict[str, object]]:
+    with db_session() as session:
+        tenant = session.scalar(select(Tenant).where(Tenant.tenant_key == tenant_key))
+        if tenant is None:
+            return []
+
+        rows = session.scalars(
+            select(DirectSalesSettlementRun)
+            .where(DirectSalesSettlementRun.tenant_id == tenant.id)
+            .order_by(desc(DirectSalesSettlementRun.settlement_date), desc(DirectSalesSettlementRun.id))
+            .limit(limit)
+        ).all()
+
+    return [
+        {
+            "id": row.id,
+            "settlement_date": row.settlement_date.isoformat(),
+            "status": row.status,
+            "direct_sales_gross": row.direct_sales_gross,
+            "tt_linked_gross": row.tt_linked_gross,
+            "net_transfer_gross": row.net_transfer_gross,
+            "lines_count": row.lines_count,
+            "posted_voucher_id": row.posted_voucher_id,
+            "message": row.message,
+            "started_at": row.started_at.isoformat(),
+            "finished_at": row.finished_at.isoformat() if row.finished_at else None,
         }
         for row in rows
     ]
@@ -1009,6 +1265,25 @@ def dashboard_home() -> str:
                         <input id="cfgAutoPaidSyncIntervalMinutes" type="number" min="1" max="1440" value="1" />
                     </div>
                     <div>
+                        <div class="toolbar-label">Daglig Direktesalg Sync</div>
+                        <select id="cfgDailyDirectSalesSyncEnabled">
+                            <option value="true">Aktiv</option>
+                            <option value="false">Inaktiv</option>
+                        </select>
+                    </div>
+                    <div>
+                        <div class="toolbar-label">Direktesalg Tid (HH:MM)</div>
+                        <input id="cfgDailyDirectSalesSyncTime" type="time" value="23:00" />
+                    </div>
+                    <div>
+                        <div class="toolbar-label">Default Inntektskonto</div>
+                        <input id="cfgDirectSalesDefaultIncomeAccount" type="text" placeholder="f.eks. 3000" />
+                    </div>
+                    <div>
+                        <div class="toolbar-label">Oppgjor Motkonto</div>
+                        <input id="cfgDirectSalesSettlementOffsetAccount" type="text" placeholder="f.eks. 1900" value="1900" />
+                    </div>
+                    <div>
                         <div class="toolbar-label">Connection Status</div>
                         <div id="cfgStatus" class="muted">Velg eller opprett tenant.</div>
                     </div>
@@ -1168,6 +1443,10 @@ def dashboard_home() -> str:
         const cfgSusoftPasswordEl = document.getElementById('cfgSusoftPassword');
         const cfgAutoPaidSyncEnabledEl = document.getElementById('cfgAutoPaidSyncEnabled');
         const cfgAutoPaidSyncIntervalMinutesEl = document.getElementById('cfgAutoPaidSyncIntervalMinutes');
+        const cfgDailyDirectSalesSyncEnabledEl = document.getElementById('cfgDailyDirectSalesSyncEnabled');
+        const cfgDailyDirectSalesSyncTimeEl = document.getElementById('cfgDailyDirectSalesSyncTime');
+        const cfgDirectSalesDefaultIncomeAccountEl = document.getElementById('cfgDirectSalesDefaultIncomeAccount');
+        const cfgDirectSalesSettlementOffsetAccountEl = document.getElementById('cfgDirectSalesSettlementOffsetAccount');
         const cfgStatusEl = document.getElementById('cfgStatus');
         const cfgSaveMessageEl = document.getElementById('cfgSaveMessage');
         const tenantListRowsEl = document.getElementById('tenantListRows');
@@ -1355,12 +1634,19 @@ def dashboard_home() -> str:
                 cfgSusoftPasswordEl.value = '';
                 cfgAutoPaidSyncEnabledEl.value = String(info.auto_paid_sync_enabled !== false);
                 cfgAutoPaidSyncIntervalMinutesEl.value = String(info.auto_paid_sync_interval_minutes || 1);
+                cfgDailyDirectSalesSyncEnabledEl.value = String(info.daily_direct_sales_sync_enabled === true);
+                cfgDailyDirectSalesSyncTimeEl.value = String(info.daily_direct_sales_sync_time || '23:00');
+                cfgDirectSalesDefaultIncomeAccountEl.value = String(info.direct_sales_default_income_account || '');
+                cfgDirectSalesSettlementOffsetAccountEl.value = String(info.direct_sales_settlement_offset_account || '1900');
                 const tt = info.has_tripletex_tokens ? 'TT OK' : 'TT mangler';
                 const ss = info.has_susoft_credentials ? 'Susoft OK' : 'Susoft mangler';
                 const autoPolling = (info.auto_paid_sync_enabled !== false)
                     ? ('Auto paid sync: hver ' + String(info.auto_paid_sync_interval_minutes || 1) + ' min')
                     : 'Auto paid sync: av';
-                cfgStatusEl.innerHTML = statusTag(info.active ? 'ACTIVE' : 'INACTIVE') + ' ' + tt + ' / ' + ss + ' / ' + autoPolling;
+                const dailySettlement = (info.daily_direct_sales_sync_enabled === true)
+                    ? ('Direktesalg sync: daglig kl ' + String(info.daily_direct_sales_sync_time || '23:00'))
+                    : 'Direktesalg sync: av';
+                cfgStatusEl.innerHTML = statusTag(info.active ? 'ACTIVE' : 'INACTIVE') + ' ' + tt + ' / ' + ss + ' / ' + autoPolling + ' / ' + dailySettlement;
             } catch (err) {
                 cfgStatusEl.textContent = 'Kunne ikke lese tenant-tilkobling: ' + String(err);
             }
@@ -1391,6 +1677,10 @@ def dashboard_home() -> str:
                 susoft_password: String(cfgSusoftPasswordEl.value || '').trim(),
                 auto_paid_sync_enabled: String(cfgAutoPaidSyncEnabledEl.value || 'true') === 'true',
                 auto_paid_sync_interval_minutes: Number(cfgAutoPaidSyncIntervalMinutesEl.value || 1),
+                daily_direct_sales_sync_enabled: String(cfgDailyDirectSalesSyncEnabledEl.value || 'false') === 'true',
+                daily_direct_sales_sync_time: String(cfgDailyDirectSalesSyncTimeEl.value || '23:00'),
+                direct_sales_default_income_account: String(cfgDirectSalesDefaultIncomeAccountEl.value || '').trim(),
+                direct_sales_settlement_offset_account: String(cfgDirectSalesSettlementOffsetAccountEl.value || '1900').trim(),
             };
 
             try {
