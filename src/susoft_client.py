@@ -267,3 +267,98 @@ def find_order_by_uuid(
     if not isinstance(data, dict):
         raise RuntimeError("Ugyldig responsformat ved oppslag av Susoft order per uuid.")
     return data
+
+
+def _request_webhook_settings_endpoint(
+    method: str,
+    *,
+    token: str,
+    overrides: dict[str, str] | None = None,
+    params: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | None = None,
+) -> requests.Response:
+    resolved = _resolve_susoft_settings(overrides)
+    headers = _base_headers(overrides=overrides)
+    headers["Authorization"] = f"Bearer {token}"
+    timeout = int(resolved["timeout"])
+
+    paths = ("/callback/settings", "/webhook/settings")
+    last_non_404: requests.Response | None = None
+    for path in paths:
+        url = f"{resolved['base_url']}{path}"
+        response = _request_with_rate_limit_retry(
+            method,
+            url,
+            timeout=timeout,
+            headers=headers,
+            params=params,
+            json_body=json_body,
+        )
+        if response.status_code != 404:
+            last_non_404 = response
+            break
+
+    if last_non_404 is not None:
+        return last_non_404
+    raise RuntimeError("Fant ikke webhook settings endpoint i Susoft API (/callback/settings eller /webhook/settings).")
+
+
+def list_webhooks(
+    webhook_type: str,
+    token: str | None = None,
+    *,
+    overrides: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    auth_token = token or _authenticate(overrides=overrides)
+
+    try:
+        response = _request_webhook_settings_endpoint(
+            "GET",
+            token=auth_token,
+            overrides=overrides,
+            params={"webhookType": webhook_type},
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Nettverksfeil ved henting av Susoft-webhooks: {exc}") from exc
+
+    if not response.ok:
+        raise RuntimeError(f"Susoft webhook-listing feilet med status {response.status_code}: {response.text}")
+
+    payload = response.json()
+    return payload if isinstance(payload, list) else []
+
+
+def add_webhook(
+    *,
+    webhook_type: str,
+    target_url: str,
+    webhook_token: str,
+    active: bool = True,
+    token: str | None = None,
+    overrides: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    auth_token = token or _authenticate(overrides=overrides)
+    body = {
+        "active": bool(active),
+        "type": webhook_type,
+        "url": target_url,
+        "token": webhook_token,
+    }
+
+    try:
+        response = _request_webhook_settings_endpoint(
+            "POST",
+            token=auth_token,
+            overrides=overrides,
+            json_body=body,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Nettverksfeil ved oppretting av Susoft-webhook: {exc}") from exc
+
+    if not response.ok:
+        raise RuntimeError(f"Susoft webhook-opprettelse feilet med status {response.status_code}: {response.text}")
+
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("Ugyldig responsformat ved oppretting av Susoft-webhook.")
+    return payload

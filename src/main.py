@@ -12,6 +12,9 @@ from src.auth import require_dashboard_auth
 from src.config import get_settings
 from src.db import db_health_check, db_session, init_db
 from src.models import JobRun, OrderSync, SyncEvent, Tenant
+from src.susoft_client import add_webhook as add_susoft_webhook
+from src.susoft_client import authenticate as authenticate_susoft
+from src.susoft_client import list_webhooks as list_susoft_webhooks
 from src.sync_service import (
     get_sendable_orders_for_tenant,
     process_susoft_payment_for_tenant,
@@ -46,6 +49,19 @@ def _tripletex_overrides_from_tenant(tenant: Tenant) -> dict[str, str]:
     return data
 
 
+def _susoft_overrides_from_tenant(tenant: Tenant) -> dict[str, str]:
+    data: dict[str, str] = {}
+    if tenant.susoft_base_url:
+        data["susoft_base_url"] = tenant.susoft_base_url
+    if tenant.susoft_shop_url_key:
+        data["susoft_shop_url_key"] = tenant.susoft_shop_url_key
+    if tenant.susoft_username:
+        data["susoft_username"] = tenant.susoft_username
+    if tenant.susoft_password:
+        data["susoft_password"] = tenant.susoft_password
+    return data
+
+
 def _keep_or_replace_secret(current: str | None, incoming: str | None) -> str | None:
     if incoming is None:
         return current
@@ -74,6 +90,38 @@ def _resolve_tripletex_webhook_tenant_key(incoming_tenant_key: str | None) -> st
         status_code=status.HTTP_400_BAD_REQUEST,
         detail="tenant_key mangler. Sett tenant_key i callback-url query eller payload.",
     )
+
+
+def _resolve_susoft_webhook_tenant_key(incoming_tenant_key: str | None) -> str:
+    if incoming_tenant_key and incoming_tenant_key.strip():
+        return incoming_tenant_key.strip()
+    return _resolve_tripletex_webhook_tenant_key(incoming_tenant_key)
+
+
+def _is_valid_webhook_secret(*, provided_header: str | None = None, provided_token: str | None = None) -> bool:
+    expected_secret = settings.webhook_shared_secret.strip()
+    if not expected_secret:
+        return True
+    if provided_header and secrets.compare_digest(str(provided_header), expected_secret):
+        return True
+    if provided_token and secrets.compare_digest(str(provided_token), expected_secret):
+        return True
+    return False
+
+
+def _extract_susoft_uuid_from_payload(payload: dict[str, object]) -> str:
+    direct_uuid = payload.get("susoft_uuid") or payload.get("susoftUuid") or payload.get("uuid")
+    if isinstance(direct_uuid, str) and direct_uuid.strip():
+        return direct_uuid.strip()
+
+    for container_key in ("entity", "order", "value", "data"):
+        container = payload.get(container_key)
+        if isinstance(container, dict):
+            nested_uuid = container.get("uuid")
+            if isinstance(nested_uuid, str) and nested_uuid.strip():
+                return nested_uuid.strip()
+
+    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="susoft_uuid mangler")
 
 
 @app.on_event("startup")
@@ -192,15 +240,22 @@ def webhook_tripletex_order(payload: dict[str, object], tenant_key: str | None =
         raise HTTPException(status_code=status_code, detail=detail) from exc
 
 
-@app.post("/webhooks/susoft/payment", dependencies=[Depends(_require_webhook_secret)])
-def webhook_susoft_payment(payload: dict[str, object]) -> dict[str, object]:
-    tenant_key = str(payload.get("tenant_key") or payload.get("tenantKey") or "").strip()
-    if not tenant_key:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="tenant_key mangler")
+@app.post("/webhooks/susoft/payment")
+def webhook_susoft_payment(
+    payload: dict[str, object],
+    tenant_key: str | None = Query(default=None),
+    token: str | None = Query(default=None),
+    x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
+) -> dict[str, object]:
+    payload_token_value = payload.get("token") if isinstance(payload.get("token"), str) else None
+    if not _is_valid_webhook_secret(provided_header=x_webhook_secret, provided_token=token or payload_token_value):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid webhook secret")
 
-    susoft_uuid = str(payload.get("susoft_uuid") or payload.get("susoftUuid") or payload.get("uuid") or "").strip()
-    if not susoft_uuid:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="susoft_uuid mangler")
+    tenant_key_value = _resolve_susoft_webhook_tenant_key(
+        tenant_key
+        or str(payload.get("tenant_key") or payload.get("tenantKey") or "").strip()
+    )
+    susoft_uuid = _extract_susoft_uuid_from_payload(payload)
 
     raw_payment_type_id = payload.get("payment_type_id") or payload.get("paymentTypeId") or 20756819
     try:
@@ -220,7 +275,7 @@ def webhook_susoft_payment(payload: dict[str, object]) -> dict[str, object]:
 
     try:
         return process_susoft_payment_for_tenant(
-            tenant_key,
+            tenant_key_value,
             susoft_uuid,
             payment_type_id=payment_type_id,
             paid_amount=paid_amount,
@@ -230,6 +285,44 @@ def webhook_susoft_payment(payload: dict[str, object]) -> dict[str, object]:
         detail = str(exc)
         status_code = status.HTTP_404_NOT_FOUND if "Fant" in detail or "finnes ikke" in detail else status.HTTP_400_BAD_REQUEST
         raise HTTPException(status_code=status_code, detail=detail) from exc
+
+
+@app.get("/api/susoft/webhooks", dependencies=[Depends(require_dashboard_auth)])
+def api_susoft_webhooks(tenant_key: str, webhook_type: str = "ON_ORDER_INVOICED") -> dict[str, object]:
+    with db_session() as session:
+        tenant = session.scalar(select(Tenant).where(Tenant.tenant_key == tenant_key))
+        if tenant is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant finnes ikke")
+
+    overrides = _susoft_overrides_from_tenant(tenant)
+    token = authenticate_susoft(overrides=overrides)
+    webhooks = list_susoft_webhooks(webhook_type, token=token, overrides=overrides)
+    return {"webhooks": webhooks}
+
+
+@app.post("/api/susoft/webhooks/order-invoiced", dependencies=[Depends(require_dashboard_auth)])
+def api_susoft_create_order_invoiced_webhook(tenant_key: str, target_url: str) -> dict[str, object]:
+    with db_session() as session:
+        tenant = session.scalar(select(Tenant).where(Tenant.tenant_key == tenant_key))
+        if tenant is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant finnes ikke")
+
+    overrides = _susoft_overrides_from_tenant(tenant)
+    token = authenticate_susoft(overrides=overrides)
+    target_url_with_tenant = _append_tenant_key_to_target_url(target_url, tenant_key)
+    shared_secret = settings.webhook_shared_secret.strip()
+    try:
+        created = add_susoft_webhook(
+            webhook_type="ON_ORDER_INVOICED",
+            target_url=target_url_with_tenant,
+            webhook_token=shared_secret,
+            active=True,
+            token=token,
+            overrides=overrides,
+        )
+        return created
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
 @app.get("/api/tripletex/webhooks/subscriptions", dependencies=[Depends(require_dashboard_auth)])
@@ -803,6 +896,27 @@ def dashboard_home() -> str:
                 </div>
             </div>
 
+            <div class="panel">
+                <h3>Susoft Webhooks</h3>
+                <div class="section-grid" style="grid-template-columns: 1.2fr auto auto; align-items: end;">
+                    <div>
+                        <div class="toolbar-label">Callback URL</div>
+                        <input id="susoftWebhookTargetUrl" type="text" placeholder="https://your-public-host/webhooks/susoft/payment" />
+                    </div>
+                    <button class="secondary" id="refreshSusoftWebhooks" type="button">Refresh Webhooks</button>
+                    <button id="createSusoftWebhook" type="button">Create ON_ORDER_INVOICED</button>
+                </div>
+                <div class="muted" style="margin-top: 10px;">
+                    Oppretter webhook for ON_ORDER_INVOICED mot valgt callback URL.
+                </div>
+                <div class="table-wrap" style="margin-top: 12px;">
+                    <table>
+                        <thead><tr><th>ID</th><th>Type</th><th>Active</th><th>URL</th><th>Last Error</th></tr></thead>
+                        <tbody id="susoftWebhookRows"><tr><td colspan="5" class="muted">Ingen webhooks lastet ennå.</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+
             <div class="grid">
                 <div class="card"><div class="k">Tenants</div><div class="v" id="tenantCount">0</div></div>
                 <div class="card"><div class="k">Running Jobs</div><div class="v" id="runningJobs">0</div></div>
@@ -887,12 +1001,15 @@ def dashboard_home() -> str:
         const cfgSaveMessageEl = document.getElementById('cfgSaveMessage');
         const tenantListRowsEl = document.getElementById('tenantListRows');
         const webhookTargetUrlEl = document.getElementById('webhookTargetUrl');
+        const susoftWebhookTargetUrlEl = document.getElementById('susoftWebhookTargetUrl');
         const logEl = document.getElementById('log');
         const eventsLevelFilterEl = document.getElementById('eventsLevelFilter');
         const webhookRowsEl = document.getElementById('webhookRows');
+        const susoftWebhookRowsEl = document.getElementById('susoftWebhookRows');
         let latestEvents = [];
         let selectedEventId = null;
         let latestWebhooks = [];
+        let latestSusoftWebhooks = [];
 
         function stamp() {
             document.getElementById('now').textContent = new Date().toLocaleString();
@@ -953,6 +1070,19 @@ def dashboard_home() -> str:
                     '<td>' + (item.targetUrl || '-') + '</td>' +
                 '</tr>';
             }).join('') || '<tr><td colspan="4" class="muted">Ingen subscriptions funnet.</td></tr>';
+        }
+
+        function renderSusoftWebhookRows(items) {
+            susoftWebhookRowsEl.innerHTML = items.map((item) => {
+                const active = item.active === true ? '<span class="tag ok">ACTIVE</span>' : '<span class="tag err">INACTIVE</span>';
+                return '<tr>' +
+                    '<td>' + (item.id || '-') + '</td>' +
+                    '<td>' + (item.type || '-') + '</td>' +
+                    '<td>' + active + '</td>' +
+                    '<td>' + (item.url || '-') + '</td>' +
+                    '<td>' + (item.lastError || '-') + '</td>' +
+                '</tr>';
+            }).join('') || '<tr><td colspan="5" class="muted">Ingen webhooks funnet.</td></tr>';
         }
 
         function renderTenantListRows(tenants) {
@@ -1104,6 +1234,7 @@ def dashboard_home() -> str:
                 tenantEl.value = tenantKey;
                 await loadTenantConnections();
                 await loadWebhooks();
+                await loadSusoftWebhooks();
                 try {
                     await loadTenantData();
                 } catch (err) {
@@ -1148,6 +1279,24 @@ def dashboard_home() -> str:
                 }
             } catch (err) {
                 webhookRowsEl.innerHTML = '<tr><td colspan="4" class="muted">Kunne ikke laste subscriptions: ' + String(err) + '</td></tr>';
+            }
+        }
+
+        async function loadSusoftWebhooks() {
+            const tenant = tenantEl.value;
+            if (!tenant) {
+                susoftWebhookRowsEl.innerHTML = '<tr><td colspan="5" class="muted">Velg tenant for Susoft webhook-oppsett.</td></tr>';
+                return;
+            }
+            try {
+                const response = await api('/api/susoft/webhooks?tenant_key=' + encodeURIComponent(tenant) + '&webhook_type=ON_ORDER_INVOICED');
+                latestSusoftWebhooks = Array.isArray(response.webhooks) ? response.webhooks : [];
+                renderSusoftWebhookRows(latestSusoftWebhooks);
+                if (!susoftWebhookTargetUrlEl.value) {
+                    susoftWebhookTargetUrlEl.value = appUrl('/webhooks/susoft/payment');
+                }
+            } catch (err) {
+                susoftWebhookRowsEl.innerHTML = '<tr><td colspan="5" class="muted">Kunne ikke laste Susoft webhooks: ' + String(err) + '</td></tr>';
             }
         }
 
@@ -1236,6 +1385,7 @@ def dashboard_home() -> str:
             await loadStatus();
             await loadTenantConnections();
             await loadWebhooks();
+            await loadSusoftWebhooks();
             await loadTenantData();
         }
 
@@ -1243,6 +1393,7 @@ def dashboard_home() -> str:
         tenantEl.addEventListener('change', async () => {
             await loadTenantConnections();
             await loadWebhooks();
+            await loadSusoftWebhooks();
             await loadTenantData();
         });
         document.getElementById('dry').addEventListener('click', () => {
@@ -1279,6 +1430,21 @@ def dashboard_home() -> str:
                 return;
             }
             action('/api/tripletex/webhooks/subscriptions/order-create?tenant_key=' + encodeURIComponent(tenant) + '&target_url=' + encodeURIComponent(targetUrl));
+        });
+
+        document.getElementById('refreshSusoftWebhooks').addEventListener('click', loadSusoftWebhooks);
+        document.getElementById('createSusoftWebhook').addEventListener('click', () => {
+            const targetUrl = String(susoftWebhookTargetUrlEl.value || '').trim();
+            const tenant = tenantEl.value;
+            if (!tenant) {
+                logEl.textContent = 'Feil: velg tenant først';
+                return;
+            }
+            if (!targetUrl) {
+                logEl.textContent = 'Feil: Susoft callback URL mangler';
+                return;
+            }
+            action('/api/susoft/webhooks/order-invoiced?tenant_key=' + encodeURIComponent(tenant) + '&target_url=' + encodeURIComponent(targetUrl));
         });
 
         document.getElementById('saveTenantConfig').addEventListener('click', saveTenantConfig);
