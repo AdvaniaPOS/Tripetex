@@ -44,15 +44,49 @@ def _ensure_schema_compatibility() -> None:
         if "tenants" not in inspector.get_table_names():
             return
 
-        existing_columns = {col["name"] for col in inspector.get_columns("tenants")}
+        def refresh_columns() -> set[str]:
+            return {col["name"] for col in inspect(conn).get_columns("tenants")}
+
+        existing_columns = refresh_columns()
         for col_name, col_type in required_tenant_columns.items():
             if col_name in existing_columns:
                 continue
-            try:
-                conn.execute(text(f"ALTER TABLE tenants ADD COLUMN {col_name} {col_type}"))
-            except Exception:
-                # Keep startup resilient across database engines and old SQLite versions.
-                pass
+
+            add_attempts = [
+                # PostgreSQL and newer engines may support IF NOT EXISTS.
+                f"ALTER TABLE tenants ADD COLUMN IF NOT EXISTS {col_name} {col_type}",
+                # Generic fallback for SQLite/MySQL/PostgreSQL.
+                f"ALTER TABLE tenants ADD COLUMN {col_name} {col_type}",
+                # Last-resort fallback without default expression.
+                f"ALTER TABLE tenants ADD COLUMN {col_name} {col_type.split(' DEFAULT ')[0]}",
+            ]
+
+            for statement in add_attempts:
+                try:
+                    conn.execute(text(statement))
+                except Exception:
+                    continue
+
+                existing_columns = refresh_columns()
+                if col_name in existing_columns:
+                    break
+
+            # If the column exists but default value was not applied, backfill nulls.
+            if col_name in existing_columns:
+                try:
+                    if col_name == "auto_paid_sync_enabled":
+                        conn.execute(text("UPDATE tenants SET auto_paid_sync_enabled = TRUE WHERE auto_paid_sync_enabled IS NULL"))
+                    elif col_name == "auto_paid_sync_interval_minutes":
+                        conn.execute(text("UPDATE tenants SET auto_paid_sync_interval_minutes = 1 WHERE auto_paid_sync_interval_minutes IS NULL"))
+                    elif col_name == "daily_direct_sales_sync_enabled":
+                        conn.execute(text("UPDATE tenants SET daily_direct_sales_sync_enabled = FALSE WHERE daily_direct_sales_sync_enabled IS NULL"))
+                    elif col_name == "daily_direct_sales_sync_time":
+                        conn.execute(text("UPDATE tenants SET daily_direct_sales_sync_time = '23:00' WHERE daily_direct_sales_sync_time IS NULL"))
+                    elif col_name == "direct_sales_settlement_offset_account":
+                        conn.execute(text("UPDATE tenants SET direct_sales_settlement_offset_account = '1900' WHERE direct_sales_settlement_offset_account IS NULL"))
+                except Exception:
+                    # Keep startup resilient if backfill syntax differs across DB engines.
+                    pass
 
 
 @contextmanager

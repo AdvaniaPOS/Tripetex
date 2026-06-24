@@ -30,7 +30,7 @@ class Tenant(Base):
     daily_direct_sales_sync_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     daily_direct_sales_sync_time: Mapped[str] = mapped_column(String(5), default="23:00")
     direct_sales_default_income_account: Mapped[str | None] = mapped_column(String(20), nullable=True)
-    direct_sales_settlement_offset_account: Mapped[str] = mapped_column(String(20), default="1900")
+    direct_sales_settlement_offset_account: Mapped[str | None] = mapped_column(String(20), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
 
