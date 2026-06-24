@@ -577,6 +577,33 @@ def dashboard_home() -> str:
         }
         .tab-panel { display: none; }
         .tab-panel.active { display: block; }
+        .menu-tabs {
+            display: inline-flex;
+            gap: 8px;
+            padding: 6px;
+            border-radius: 999px;
+            background: #eef3f8;
+            border: 1px solid #dae3ec;
+            margin: 10px 0 14px;
+        }
+        .menu-btn {
+            border: none;
+            background: transparent;
+            color: var(--muted);
+            box-shadow: none;
+            padding: 9px 16px;
+            border-radius: 999px;
+            cursor: pointer;
+            font-weight: 800;
+            width: auto;
+        }
+        .menu-btn:hover { transform: none; filter: none; }
+        .menu-btn.active {
+            background: linear-gradient(180deg, var(--brand-2) 0%, var(--brand) 100%);
+            color: #fff;
+        }
+        .menu-panel { display: none; }
+        .menu-panel.active { display: block; }
         .clickable-row { cursor: pointer; }
         .clickable-row.selected { background: #eaf3fb; }
         .table-wrap {
@@ -622,156 +649,179 @@ def dashboard_home() -> str:
             </div>
         </div>
 
-        <div class="controls">
-            <div>
-                <div class="toolbar-label">Tenant</div>
-            <select id="tenant"></select>
-            </div>
-            <div>
-                <div class="toolbar-label">Limit</div>
-            <input id="limit" type="number" min="1" max="500" value="50" />
-            </div>
-            <button id="dry">Manual Sync (Dry)</button>
-            <button id="exec">Manual Sync (Execute)</button>
-            <button class="secondary" id="retry">Retry Failed</button>
-            <button class="secondary" id="paid">Sync Paid -> TT</button>
-            <button class="secondary" id="refresh">Refresh</button>
+        <div class="menu-tabs" role="tablist" aria-label="Hovedmeny">
+            <button class="menu-btn active" id="menuAddTenant" type="button">Legg til tenant</button>
+            <button class="menu-btn" id="menuAllTenants" type="button">Alle tenants</button>
+            <button class="menu-btn" id="menuSupport" type="button">Support</button>
         </div>
 
-        <div class="panel">
-            <h3>Tenant Setup</h3>
-            <div class="section-grid" style="grid-template-columns: repeat(4, minmax(0, 1fr)); align-items: end;">
-                <div>
-                    <div class="toolbar-label">Tenant Key</div>
-                    <input id="cfgTenantKey" type="text" placeholder="butikk-1" />
-                </div>
-                <div>
-                    <div class="toolbar-label">Tenant Name</div>
-                    <input id="cfgTenantName" type="text" placeholder="Butikk 1" />
-                </div>
-                <div>
-                    <div class="toolbar-label">Tripletex Base URL</div>
-                    <input id="cfgTripletexBaseUrl" type="text" placeholder="https://tripletex.no/v2" />
-                </div>
-                <div>
-                    <div class="toolbar-label">Susoft Base URL</div>
-                    <input id="cfgSusoftBaseUrl" type="text" placeholder="https://api.susoft.com:4443" />
-                </div>
-                <div>
-                    <div class="toolbar-label">Tripletex Consumer Token</div>
-                    <input id="cfgTripletexConsumerToken" type="text" placeholder="Lim inn token (tom = behold eksisterende)" />
-                </div>
-                <div>
-                    <div class="toolbar-label">Tripletex Employee Token</div>
-                    <input id="cfgTripletexEmployeeToken" type="text" placeholder="Lim inn token (tom = behold eksisterende)" />
-                </div>
-                <div>
-                    <div class="toolbar-label">Susoft Shop URL Key</div>
-                    <input id="cfgSusoftShopUrlKey" type="text" placeholder="Lim inn key (tom = behold eksisterende)" />
-                </div>
-                <div>
-                    <div class="toolbar-label">Susoft Username</div>
-                    <input id="cfgSusoftUsername" type="text" placeholder="Bruker (tom = behold eksisterende)" />
-                </div>
-                <div style="grid-column: span 2;">
-                    <div class="toolbar-label">Susoft Password</div>
-                    <input id="cfgSusoftPassword" type="password" placeholder="Passord (tom = behold eksisterende)" />
-                </div>
-                <div>
-                    <div class="toolbar-label">Connection Status</div>
-                    <div id="cfgStatus" class="muted">Velg eller opprett tenant.</div>
-                </div>
-                <div>
-                    <button id="saveTenantConfig" type="button">Save Tenant Config</button>
-                </div>
-            </div>
-        </div>
-
-        <div class="panel">
-            <h3>Tripletex Webhooks</h3>
-            <div class="section-grid" style="grid-template-columns: 1.2fr 0.6fr auto auto; align-items: end;">
-                <div>
-                    <div class="toolbar-label">Callback URL</div>
-                    <input id="webhookTargetUrl" type="text" placeholder="https://your-public-host/webhooks/tripletex/order" />
-                </div>
-                <div>
-                    <div class="toolbar-label">Secret</div>
-                    <input id="webhookSecretPreview" type="text" readonly value="X-Webhook-Secret" />
-                </div>
-                <button class="secondary" id="refreshWebhooks" type="button">Refresh Subscriptions</button>
-                <button id="createOrderWebhook" type="button">Create order.create</button>
-            </div>
-            <div class="muted" style="margin-top: 10px;">
-                Tripletex må sende til en offentlig URL. Lokale localhost-adresser vil ikke nå oss fra Tripletex.
-            </div>
-            <div class="table-wrap" style="margin-top: 12px;">
-                <table>
-                    <thead><tr><th>ID</th><th>Event</th><th>Status</th><th>Target URL</th></tr></thead>
-                    <tbody id="webhookRows"><tr><td colspan="4" class="muted">Ingen subscriptions lastet ennå.</td></tr></tbody>
-                </table>
-            </div>
-        </div>
-
-        <div class="grid">
-            <div class="card"><div class="k">Tenants</div><div class="v" id="tenantCount">0</div></div>
-            <div class="card"><div class="k">Running Jobs</div><div class="v" id="runningJobs">0</div></div>
-            <div class="card"><div class="k">Latest Job</div><div class="v small" id="latestJob">-</div></div>
-            <div class="card"><div class="k">Health</div><div class="v small" id="health">-</div></div>
-            <div class="card"><div class="k">Sendable Now</div><div class="v" id="sendableCount">0</div></div>
-            <div class="card"><div class="k">Already Handled</div><div class="v" id="handledCount">0</div></div>
-        </div>
-
-        <div class="panel">
-            <h3>Sendable Orders Now</h3>
-            <div class="table-wrap">
-                <table>
-                    <thead><tr><th>TT Order</th><th>Number</th><th>Order Date</th><th>Local Status</th><th>Susoft UUID</th></tr></thead>
-                    <tbody id="sendableRows"></tbody>
-                </table>
-            </div>
-        </div>
-
-        <div class="panel">
-            <h3>Order Sync</h3>
-            <div class="table-wrap">
-                <table>
-                    <thead><tr><th>ID</th><th>TT Order</th><th>Status</th><th>Susoft UUID</th><th>Error</th><th>Updated</th></tr></thead>
-                    <tbody id="orderRows"></tbody>
-                </table>
-            </div>
-        </div>
-
-        <div class="panel">
-            <h3>Events</h3>
-            <div class="tabs" role="tablist" aria-label="Events tabs">
-                <button class="tab-btn active" id="eventsShortTab" type="button">Kort</button>
-                <button class="tab-btn" id="eventsDetailTab" type="button">Detaljer</button>
-            </div>
-            <div class="toolbar-label">Filter</div>
-            <div style="max-width: 220px; margin-bottom: 12px;">
-                <select id="eventsLevelFilter">
-                    <option value="ERROR" selected>Error</option>
-                    <option value="WARN">Warn</option>
-                    <option value="INFO">Info</option>
-                    <option value="ALL">Alle nivåer</option>
-                </select>
-            </div>
-            <div class="tab-panel active" id="eventsShortPanel">
+        <div class="menu-panel" id="menuAllTenantsPanel">
+            <div class="panel">
+                <h3>Alle Tenants</h3>
                 <div class="table-wrap">
                     <table>
-                        <thead><tr><th>ID</th><th>Level</th><th>Type</th><th>Created</th></tr></thead>
-                        <tbody id="eventRows"></tbody>
+                        <thead><tr><th>Key</th><th>Navn</th><th>Aktiv</th><th>Tripletex</th><th>Susoft</th><th>Handling</th></tr></thead>
+                        <tbody id="tenantListRows"><tr><td colspan="6" class="muted">Ingen tenants funnet.</td></tr></tbody>
                     </table>
                 </div>
             </div>
-            <div class="tab-panel" id="eventsDetailPanel">
+        </div>
+
+        <div class="menu-panel active" id="menuAddTenantPanel">
+
+            <div class="panel">
+                <h3>Tenant Setup</h3>
+                <div class="section-grid" style="grid-template-columns: repeat(4, minmax(0, 1fr)); align-items: end;">
+                    <div>
+                        <div class="toolbar-label">Tenant Key</div>
+                        <input id="cfgTenantKey" type="text" placeholder="butikk-1" />
+                    </div>
+                    <div>
+                        <div class="toolbar-label">Tenant Name</div>
+                        <input id="cfgTenantName" type="text" placeholder="Butikk 1" />
+                    </div>
+                    <div>
+                        <div class="toolbar-label">Tripletex Base URL</div>
+                        <input id="cfgTripletexBaseUrl" type="text" placeholder="https://tripletex.no/v2" />
+                    </div>
+                    <div>
+                        <div class="toolbar-label">Susoft Base URL</div>
+                        <input id="cfgSusoftBaseUrl" type="text" placeholder="https://api.susoft.com:4443" />
+                    </div>
+                    <div>
+                        <div class="toolbar-label">Tripletex Consumer Token</div>
+                        <input id="cfgTripletexConsumerToken" type="text" placeholder="Lim inn token (tom = behold eksisterende)" />
+                    </div>
+                    <div>
+                        <div class="toolbar-label">Tripletex Employee Token</div>
+                        <input id="cfgTripletexEmployeeToken" type="text" placeholder="Lim inn token (tom = behold eksisterende)" />
+                    </div>
+                    <div>
+                        <div class="toolbar-label">Susoft Shop URL Key</div>
+                        <input id="cfgSusoftShopUrlKey" type="text" placeholder="Lim inn key (tom = behold eksisterende)" />
+                    </div>
+                    <div>
+                        <div class="toolbar-label">Susoft Username</div>
+                        <input id="cfgSusoftUsername" type="text" placeholder="Bruker (tom = behold eksisterende)" />
+                    </div>
+                    <div style="grid-column: span 2;">
+                        <div class="toolbar-label">Susoft Password</div>
+                        <input id="cfgSusoftPassword" type="password" placeholder="Passord (tom = behold eksisterende)" />
+                    </div>
+                    <div>
+                        <div class="toolbar-label">Connection Status</div>
+                        <div id="cfgStatus" class="muted">Velg eller opprett tenant.</div>
+                    </div>
+                    <div>
+                        <button id="saveTenantConfig" type="button">Save Tenant Config</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="menu-panel" id="menuSupportPanel">
+            <div class="controls">
+                <div>
+                    <div class="toolbar-label">Tenant</div>
+                <select id="tenant"></select>
+                </div>
+                <div>
+                    <div class="toolbar-label">Limit</div>
+                <input id="limit" type="number" min="1" max="500" value="50" />
+                </div>
+                <button id="dry">Manual Sync (Dry)</button>
+                <button id="exec">Manual Sync (Execute)</button>
+                <button class="secondary" id="retry">Retry Failed</button>
+                <button class="secondary" id="paid">Sync Paid -> TT</button>
+                <button class="secondary" id="refresh">Refresh</button>
+            </div>
+
+            <div class="panel">
+                <h3>Tripletex Webhooks</h3>
+                <div class="section-grid" style="grid-template-columns: 1.2fr 0.6fr auto auto; align-items: end;">
+                    <div>
+                        <div class="toolbar-label">Callback URL</div>
+                        <input id="webhookTargetUrl" type="text" placeholder="https://your-public-host/webhooks/tripletex/order" />
+                    </div>
+                    <div>
+                        <div class="toolbar-label">Secret</div>
+                        <input id="webhookSecretPreview" type="text" readonly value="X-Webhook-Secret" />
+                    </div>
+                    <button class="secondary" id="refreshWebhooks" type="button">Refresh Subscriptions</button>
+                    <button id="createOrderWebhook" type="button">Create order.create</button>
+                </div>
+                <div class="muted" style="margin-top: 10px;">
+                    Tripletex må sende til en offentlig URL. Lokale localhost-adresser vil ikke nå oss fra Tripletex.
+                </div>
+                <div class="table-wrap" style="margin-top: 12px;">
+                    <table>
+                        <thead><tr><th>ID</th><th>Event</th><th>Status</th><th>Target URL</th></tr></thead>
+                        <tbody id="webhookRows"><tr><td colspan="4" class="muted">Ingen subscriptions lastet ennå.</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="grid">
+                <div class="card"><div class="k">Tenants</div><div class="v" id="tenantCount">0</div></div>
+                <div class="card"><div class="k">Running Jobs</div><div class="v" id="runningJobs">0</div></div>
+                <div class="card"><div class="k">Latest Job</div><div class="v small" id="latestJob">-</div></div>
+                <div class="card"><div class="k">Health</div><div class="v small" id="health">-</div></div>
+                <div class="card"><div class="k">Sendable Now</div><div class="v" id="sendableCount">0</div></div>
+                <div class="card"><div class="k">Already Handled</div><div class="v" id="handledCount">0</div></div>
+            </div>
+
+            <div class="panel">
+                <h3>Sendable Orders Now</h3>
                 <div class="table-wrap">
                     <table>
-                        <thead><tr><th>Selected Event</th><th>Value</th></tr></thead>
-                        <tbody id="eventDetailRows">
-                            <tr><td class="muted">Velg en event i kort-visningen for å se detaljer.</td><td>-</td></tr>
-                        </tbody>
+                        <thead><tr><th>TT Order</th><th>Number</th><th>Order Date</th><th>Local Status</th><th>Susoft UUID</th></tr></thead>
+                        <tbody id="sendableRows"></tbody>
                     </table>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h3>Order Sync</h3>
+                <div class="table-wrap">
+                    <table>
+                        <thead><tr><th>ID</th><th>TT Order</th><th>Status</th><th>Susoft UUID</th><th>Error</th><th>Updated</th></tr></thead>
+                        <tbody id="orderRows"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h3>Events</h3>
+                <div class="tabs" role="tablist" aria-label="Events tabs">
+                    <button class="tab-btn active" id="eventsShortTab" type="button">Kort</button>
+                    <button class="tab-btn" id="eventsDetailTab" type="button">Detaljer</button>
+                </div>
+                <div class="toolbar-label">Filter</div>
+                <div style="max-width: 220px; margin-bottom: 12px;">
+                    <select id="eventsLevelFilter">
+                        <option value="ERROR" selected>Error</option>
+                        <option value="WARN">Warn</option>
+                        <option value="INFO">Info</option>
+                        <option value="ALL">Alle nivåer</option>
+                    </select>
+                </div>
+                <div class="tab-panel active" id="eventsShortPanel">
+                    <div class="table-wrap">
+                        <table>
+                            <thead><tr><th>ID</th><th>Level</th><th>Type</th><th>Created</th></tr></thead>
+                            <tbody id="eventRows"></tbody>
+                        </table>
+                    </div>
+                </div>
+                <div class="tab-panel" id="eventsDetailPanel">
+                    <div class="table-wrap">
+                        <table>
+                            <thead><tr><th>Selected Event</th><th>Value</th></tr></thead>
+                            <tbody id="eventDetailRows">
+                                <tr><td class="muted">Velg en event i kort-visningen for å se detaljer.</td><td>-</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
                 </div>
             </div>
         </div>
@@ -792,6 +842,7 @@ def dashboard_home() -> str:
         const cfgSusoftUsernameEl = document.getElementById('cfgSusoftUsername');
         const cfgSusoftPasswordEl = document.getElementById('cfgSusoftPassword');
         const cfgStatusEl = document.getElementById('cfgStatus');
+        const tenantListRowsEl = document.getElementById('tenantListRows');
         const webhookTargetUrlEl = document.getElementById('webhookTargetUrl');
         const logEl = document.getElementById('log');
         const eventsLevelFilterEl = document.getElementById('eventsLevelFilter');
@@ -861,6 +912,42 @@ def dashboard_home() -> str:
             }).join('') || '<tr><td colspan="4" class="muted">Ingen subscriptions funnet.</td></tr>';
         }
 
+        function renderTenantListRows(tenants) {
+            tenantListRowsEl.innerHTML = tenants.map((tenant) => {
+                return '<tr>' +
+                    '<td>' + tenant.tenant_key + '</td>' +
+                    '<td>' + (tenant.name || '-') + '</td>' +
+                    '<td>' + statusTag(tenant.active ? 'ACTIVE' : 'INACTIVE') + '</td>' +
+                    '<td>' + statusTag(tenant.has_tripletex_tokens ? 'OK' : 'MISSING') + '</td>' +
+                    '<td>' + statusTag(tenant.has_susoft_credentials ? 'OK' : 'MISSING') + '</td>' +
+                    '<td><button class="secondary" type="button" onclick="selectTenantFromList(\'' + tenant.tenant_key + '\')">Velg</button></td>' +
+                '</tr>';
+            }).join('') || '<tr><td colspan="6" class="muted">Ingen tenants funnet.</td></tr>';
+        }
+
+        function setMenu(activeMenuId) {
+            ['menuAddTenant', 'menuAllTenants', 'menuSupport'].forEach((id) => {
+                document.getElementById(id).classList.toggle('active', id === activeMenuId);
+            });
+            const panelByMenu = {
+                menuAddTenant: 'menuAddTenantPanel',
+                menuAllTenants: 'menuAllTenantsPanel',
+                menuSupport: 'menuSupportPanel',
+            };
+            Object.values(panelByMenu).forEach((panelId) => {
+                document.getElementById(panelId).classList.remove('active');
+            });
+            document.getElementById(panelByMenu[activeMenuId]).classList.add('active');
+        }
+
+        window.selectTenantFromList = async function(tenantKey) {
+            tenantEl.value = tenantKey;
+            await loadTenantConnections();
+            await loadWebhooks();
+            await loadTenantData();
+            setMenu('menuSupport');
+        };
+
         async function api(url, opts) {
             const r = await fetch(url, opts || {});
             if (!r.ok) {
@@ -890,6 +977,7 @@ def dashboard_home() -> str:
             } else if (current && tenants.some((t) => t.tenant_key === current)) {
                 tenantEl.value = current;
             }
+            renderTenantListRows(tenants);
             return tenants;
         }
 
@@ -1109,6 +1197,9 @@ def dashboard_home() -> str:
         });
 
         document.getElementById('saveTenantConfig').addEventListener('click', saveTenantConfig);
+        document.getElementById('menuAddTenant').addEventListener('click', () => setMenu('menuAddTenant'));
+        document.getElementById('menuAllTenants').addEventListener('click', () => setMenu('menuAllTenants'));
+        document.getElementById('menuSupport').addEventListener('click', () => setMenu('menuSupport'));
 
         document.getElementById('eventsShortTab').addEventListener('click', () => {
             document.getElementById('eventsShortTab').classList.add('active');
