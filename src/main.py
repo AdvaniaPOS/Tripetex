@@ -715,6 +715,10 @@ def dashboard_home() -> str:
                     <div>
                         <button id="saveTenantConfig" type="button">Save Tenant Config</button>
                     </div>
+                    <div>
+                        <div class="toolbar-label">Lagringsstatus</div>
+                        <div id="cfgSaveMessage" class="muted">Ikke lagret ennå.</div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -842,6 +846,7 @@ def dashboard_home() -> str:
         const cfgSusoftUsernameEl = document.getElementById('cfgSusoftUsername');
         const cfgSusoftPasswordEl = document.getElementById('cfgSusoftPassword');
         const cfgStatusEl = document.getElementById('cfgStatus');
+        const cfgSaveMessageEl = document.getElementById('cfgSaveMessage');
         const tenantListRowsEl = document.getElementById('tenantListRows');
         const webhookTargetUrlEl = document.getElementById('webhookTargetUrl');
         const logEl = document.getElementById('log');
@@ -1007,10 +1012,14 @@ def dashboard_home() -> str:
         }
 
         async function saveTenantConfig() {
+            const saveBtn = document.getElementById('saveTenantConfig');
             const tenantKey = String(cfgTenantKeyEl.value || '').trim();
             const tenantName = String(cfgTenantNameEl.value || '').trim();
             if (!tenantKey || !tenantName) {
-                logEl.textContent = 'Feil: tenant key og name er påkrevd';
+                const message = 'Feil: tenant key og name er påkrevd';
+                cfgSaveMessageEl.textContent = message;
+                cfgStatusEl.textContent = message;
+                logEl.textContent = message;
                 return;
             }
 
@@ -1028,12 +1037,18 @@ def dashboard_home() -> str:
             };
 
             try {
+                saveBtn.setAttribute('disabled', 'disabled');
+                saveBtn.textContent = 'Lagrer...';
+                cfgSaveMessageEl.textContent = 'Lagrer tenant...';
                 logEl.textContent = 'Lagrer tenant: ' + tenantKey;
+
                 const result = await api('/api/tenants', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(payload),
                 });
+
+                cfgSaveMessageEl.textContent = 'Lagret: ' + result.tenant_key;
                 logEl.textContent = JSON.stringify(result, null, 2);
                 await loadTenants();
                 tenantEl.value = tenantKey;
@@ -1041,7 +1056,13 @@ def dashboard_home() -> str:
                 await loadWebhooks();
                 await loadTenantData();
             } catch (err) {
-                logEl.textContent = 'Feil ved tenant-lagring: ' + err;
+                const errorText = 'Feil ved tenant-lagring: ' + String(err);
+                cfgSaveMessageEl.textContent = errorText;
+                cfgStatusEl.textContent = errorText;
+                logEl.textContent = errorText;
+            } finally {
+                saveBtn.removeAttribute('disabled');
+                saveBtn.textContent = 'Save Tenant Config';
             }
         }
 
