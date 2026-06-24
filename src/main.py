@@ -220,16 +220,19 @@ def api_tripletex_create_order_webhook(tenant_key: str, target_url: str) -> dict
 
     overrides = _tripletex_overrides_from_tenant(tenant)
     token = create_session_token(overrides=overrides)
-    result = create_event_subscription(
-        token,
-        event="order.create",
-        target_url=target_url,
-        overrides=overrides,
-        auth_header_name="X-Webhook-Secret" if settings.webhook_shared_secret.strip() else None,
-        auth_header_value=settings.webhook_shared_secret.strip() or None,
-        fields="id,number,orderDate,customer(id,name),orderLines(id,description,count,product(id,number,name),currency(id),discount,markup,unitPriceExcludingVatCurrency,unitPriceIncludingVatCurrency,amountExcludingVatCurrency,amountIncludingVatCurrency,vatType(id,number,name,percentage))",
-    )
-    return result
+    try:
+        # Keep subscription payload minimal. Some Tripletex setups reject complex fields filters for events.
+        result = create_event_subscription(
+            token,
+            event="order.create",
+            target_url=target_url,
+            overrides=overrides,
+            auth_header_name="X-Webhook-Secret" if settings.webhook_shared_secret.strip() else None,
+            auth_header_value=settings.webhook_shared_secret.strip() or None,
+        )
+        return result
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
 @app.post("/api/tenants", dependencies=[Depends(require_dashboard_auth)])
