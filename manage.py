@@ -26,7 +26,18 @@ def cmd_add_tenant(args: argparse.Namespace) -> None:
             print(f"Tenant already exists: id={existing.id} key={existing.tenant_key}")
             return
 
-        tenant = Tenant(tenant_key=args.tenant_key, name=args.name, active=not args.inactive)
+        tenant = Tenant(
+            tenant_key=args.tenant_key,
+            name=args.name,
+            active=not args.inactive,
+            tripletex_base_url=args.tripletex_base_url,
+            tripletex_consumer_token=args.tripletex_consumer_token,
+            tripletex_employee_token=args.tripletex_employee_token,
+            susoft_base_url=args.susoft_base_url,
+            susoft_shop_url_key=args.susoft_shop_url_key,
+            susoft_username=args.susoft_username,
+            susoft_password=args.susoft_password,
+        )
         session.add(tenant)
         session.commit()
         session.refresh(tenant)
@@ -104,6 +115,13 @@ def build_parser() -> argparse.ArgumentParser:
     add_tenant_parser.add_argument("--tenant-key", required=True)
     add_tenant_parser.add_argument("--name", required=True)
     add_tenant_parser.add_argument("--inactive", action="store_true")
+    add_tenant_parser.add_argument("--tripletex-base-url", default=None)
+    add_tenant_parser.add_argument("--tripletex-consumer-token", default=None)
+    add_tenant_parser.add_argument("--tripletex-employee-token", default=None)
+    add_tenant_parser.add_argument("--susoft-base-url", default=None)
+    add_tenant_parser.add_argument("--susoft-shop-url-key", default=None)
+    add_tenant_parser.add_argument("--susoft-username", default=None)
+    add_tenant_parser.add_argument("--susoft-password", default=None)
     add_tenant_parser.set_defaults(func=cmd_add_tenant)
 
     list_tenants_parser = sub.add_parser("list-tenants", help="List tenants")

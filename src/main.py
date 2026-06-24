@@ -34,6 +34,24 @@ def _require_webhook_secret(x_webhook_secret: str | None = Header(default=None, 
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid webhook secret")
 
 
+def _tripletex_overrides_from_tenant(tenant: Tenant) -> dict[str, str]:
+    data: dict[str, str] = {}
+    if tenant.tripletex_base_url:
+        data["tripletex_base_url"] = tenant.tripletex_base_url
+    if tenant.tripletex_consumer_token:
+        data["tripletex_consumer_token"] = tenant.tripletex_consumer_token
+    if tenant.tripletex_employee_token:
+        data["tripletex_employee_token"] = tenant.tripletex_employee_token
+    return data
+
+
+def _keep_or_replace_secret(current: str | None, incoming: str | None) -> str | None:
+    if incoming is None:
+        return current
+    value = incoming.strip()
+    return current if not value else value
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     app.state.startup_error = None
@@ -181,24 +199,109 @@ def webhook_susoft_payment(payload: dict[str, object]) -> dict[str, object]:
 
 
 @app.get("/api/tripletex/webhooks/subscriptions", dependencies=[Depends(require_dashboard_auth)])
-def api_tripletex_webhook_subscriptions() -> dict[str, object]:
-    token = create_session_token()
-    subscriptions = list_event_subscriptions(token)
+def api_tripletex_webhook_subscriptions(tenant_key: str) -> dict[str, object]:
+    with db_session() as session:
+        tenant = session.scalar(select(Tenant).where(Tenant.tenant_key == tenant_key))
+        if tenant is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant finnes ikke")
+
+    overrides = _tripletex_overrides_from_tenant(tenant)
+    token = create_session_token(overrides=overrides)
+    subscriptions = list_event_subscriptions(token, overrides=overrides)
     return {"subscriptions": subscriptions}
 
 
 @app.post("/api/tripletex/webhooks/subscriptions/order-create", dependencies=[Depends(require_dashboard_auth)])
-def api_tripletex_create_order_webhook(target_url: str) -> dict[str, object]:
-    token = create_session_token()
+def api_tripletex_create_order_webhook(tenant_key: str, target_url: str) -> dict[str, object]:
+    with db_session() as session:
+        tenant = session.scalar(select(Tenant).where(Tenant.tenant_key == tenant_key))
+        if tenant is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant finnes ikke")
+
+    overrides = _tripletex_overrides_from_tenant(tenant)
+    token = create_session_token(overrides=overrides)
     result = create_event_subscription(
         token,
         event="order.create",
         target_url=target_url,
+        overrides=overrides,
         auth_header_name="X-Webhook-Secret" if settings.webhook_shared_secret.strip() else None,
         auth_header_value=settings.webhook_shared_secret.strip() or None,
         fields="id,number,orderDate,customer(id,name),orderLines(id,description,count,product(id,number,name),currency(id),discount,markup,unitPriceExcludingVatCurrency,unitPriceIncludingVatCurrency,amountExcludingVatCurrency,amountIncludingVatCurrency,vatType(id,number,name,percentage))",
     )
     return result
+
+
+@app.post("/api/tenants", dependencies=[Depends(require_dashboard_auth)])
+def api_upsert_tenant(payload: dict[str, object]) -> dict[str, object]:
+    tenant_key = str(payload.get("tenant_key") or payload.get("tenantKey") or "").strip()
+    name = str(payload.get("name") or "").strip()
+    if not tenant_key:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="tenant_key mangler")
+    if not name:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="name mangler")
+
+    with db_session() as session:
+        row = session.scalar(select(Tenant).where(Tenant.tenant_key == tenant_key))
+        if row is None:
+            row = Tenant(tenant_key=tenant_key, name=name, active=True)
+            session.add(row)
+            session.flush()
+
+        row.name = name
+        row.active = bool(payload.get("active", True))
+        row.tripletex_base_url = str(payload.get("tripletex_base_url") or payload.get("tripletexBaseUrl") or row.tripletex_base_url or "").strip() or None
+        row.tripletex_consumer_token = _keep_or_replace_secret(
+            row.tripletex_consumer_token,
+            payload.get("tripletex_consumer_token") if "tripletex_consumer_token" in payload else payload.get("tripletexConsumerToken"),
+        )
+        row.tripletex_employee_token = _keep_or_replace_secret(
+            row.tripletex_employee_token,
+            payload.get("tripletex_employee_token") if "tripletex_employee_token" in payload else payload.get("tripletexEmployeeToken"),
+        )
+        row.susoft_base_url = str(payload.get("susoft_base_url") or payload.get("susoftBaseUrl") or row.susoft_base_url or "").strip() or None
+        row.susoft_shop_url_key = _keep_or_replace_secret(
+            row.susoft_shop_url_key,
+            payload.get("susoft_shop_url_key") if "susoft_shop_url_key" in payload else payload.get("susoftShopUrlKey"),
+        )
+        row.susoft_username = _keep_or_replace_secret(
+            row.susoft_username,
+            payload.get("susoft_username") if "susoft_username" in payload else payload.get("susoftUsername"),
+        )
+        row.susoft_password = _keep_or_replace_secret(
+            row.susoft_password,
+            payload.get("susoft_password") if "susoft_password" in payload else payload.get("susoftPassword"),
+        )
+
+        session.commit()
+        session.refresh(row)
+
+    return {
+        "id": row.id,
+        "tenant_key": row.tenant_key,
+        "name": row.name,
+        "active": row.active,
+        "has_tripletex_tokens": bool(row.tripletex_consumer_token and row.tripletex_employee_token),
+        "has_susoft_credentials": bool(row.susoft_shop_url_key and row.susoft_username and row.susoft_password),
+    }
+
+
+@app.get("/api/tenants/{tenant_key}/connections", dependencies=[Depends(require_dashboard_auth)])
+def api_tenant_connections(tenant_key: str) -> dict[str, object]:
+    with db_session() as session:
+        row = session.scalar(select(Tenant).where(Tenant.tenant_key == tenant_key))
+        if row is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant finnes ikke")
+
+    return {
+        "tenant_key": row.tenant_key,
+        "name": row.name,
+        "active": row.active,
+        "tripletex_base_url": row.tripletex_base_url or settings.tripletex_base_url,
+        "susoft_base_url": row.susoft_base_url or settings.susoft_base_url,
+        "has_tripletex_tokens": bool(row.tripletex_consumer_token and row.tripletex_employee_token),
+        "has_susoft_credentials": bool(row.susoft_shop_url_key and row.susoft_username and row.susoft_password),
+    }
 
 
 @app.get("/api/tenants/{tenant_key}/sendable-orders", dependencies=[Depends(require_dashboard_auth)])
@@ -221,6 +324,8 @@ def api_tenants() -> list[dict[str, object]]:
             "tenant_key": row.tenant_key,
             "name": row.name,
             "active": row.active,
+            "has_tripletex_tokens": bool(row.tripletex_consumer_token and row.tripletex_employee_token),
+            "has_susoft_credentials": bool(row.susoft_shop_url_key and row.susoft_username and row.susoft_password),
             "created_at": row.created_at.isoformat(),
         }
         for row in rows
@@ -534,6 +639,55 @@ def dashboard_home() -> str:
         </div>
 
         <div class="panel">
+            <h3>Tenant Setup</h3>
+            <div class="section-grid" style="grid-template-columns: repeat(4, minmax(0, 1fr)); align-items: end;">
+                <div>
+                    <div class="toolbar-label">Tenant Key</div>
+                    <input id="cfgTenantKey" type="text" placeholder="butikk-1" />
+                </div>
+                <div>
+                    <div class="toolbar-label">Tenant Name</div>
+                    <input id="cfgTenantName" type="text" placeholder="Butikk 1" />
+                </div>
+                <div>
+                    <div class="toolbar-label">Tripletex Base URL</div>
+                    <input id="cfgTripletexBaseUrl" type="text" placeholder="https://tripletex.no/v2" />
+                </div>
+                <div>
+                    <div class="toolbar-label">Susoft Base URL</div>
+                    <input id="cfgSusoftBaseUrl" type="text" placeholder="https://api.susoft.com:4443" />
+                </div>
+                <div>
+                    <div class="toolbar-label">Tripletex Consumer Token</div>
+                    <input id="cfgTripletexConsumerToken" type="text" placeholder="Lim inn token (tom = behold eksisterende)" />
+                </div>
+                <div>
+                    <div class="toolbar-label">Tripletex Employee Token</div>
+                    <input id="cfgTripletexEmployeeToken" type="text" placeholder="Lim inn token (tom = behold eksisterende)" />
+                </div>
+                <div>
+                    <div class="toolbar-label">Susoft Shop URL Key</div>
+                    <input id="cfgSusoftShopUrlKey" type="text" placeholder="Lim inn key (tom = behold eksisterende)" />
+                </div>
+                <div>
+                    <div class="toolbar-label">Susoft Username</div>
+                    <input id="cfgSusoftUsername" type="text" placeholder="Bruker (tom = behold eksisterende)" />
+                </div>
+                <div style="grid-column: span 2;">
+                    <div class="toolbar-label">Susoft Password</div>
+                    <input id="cfgSusoftPassword" type="password" placeholder="Passord (tom = behold eksisterende)" />
+                </div>
+                <div>
+                    <div class="toolbar-label">Connection Status</div>
+                    <div id="cfgStatus" class="muted">Velg eller opprett tenant.</div>
+                </div>
+                <div>
+                    <button id="saveTenantConfig" type="button">Save Tenant Config</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel">
             <h3>Tripletex Webhooks</h3>
             <div class="section-grid" style="grid-template-columns: 1.2fr 0.6fr auto auto; align-items: end;">
                 <div>
@@ -628,6 +782,16 @@ def dashboard_home() -> str:
     <script>
         const tenantEl = document.getElementById('tenant');
         const limitEl = document.getElementById('limit');
+        const cfgTenantKeyEl = document.getElementById('cfgTenantKey');
+        const cfgTenantNameEl = document.getElementById('cfgTenantName');
+        const cfgTripletexBaseUrlEl = document.getElementById('cfgTripletexBaseUrl');
+        const cfgSusoftBaseUrlEl = document.getElementById('cfgSusoftBaseUrl');
+        const cfgTripletexConsumerTokenEl = document.getElementById('cfgTripletexConsumerToken');
+        const cfgTripletexEmployeeTokenEl = document.getElementById('cfgTripletexEmployeeToken');
+        const cfgSusoftShopUrlKeyEl = document.getElementById('cfgSusoftShopUrlKey');
+        const cfgSusoftUsernameEl = document.getElementById('cfgSusoftUsername');
+        const cfgSusoftPasswordEl = document.getElementById('cfgSusoftPassword');
+        const cfgStatusEl = document.getElementById('cfgStatus');
         const webhookTargetUrlEl = document.getElementById('webhookTargetUrl');
         const logEl = document.getElementById('log');
         const eventsLevelFilterEl = document.getElementById('eventsLevelFilter');
@@ -707,12 +871,15 @@ def dashboard_home() -> str:
         }
 
         async function loadTenants() {
+            const current = tenantEl.value;
             const tenants = await api('/api/tenants');
             tenantEl.innerHTML = '';
             tenants.forEach((t) => {
                 const o = document.createElement('option');
                 o.value = t.tenant_key;
-                o.textContent = t.tenant_key + ' (' + t.name + ')';
+                const ttBadge = t.has_tripletex_tokens ? 'TT' : 'no-TT';
+                const ssBadge = t.has_susoft_credentials ? 'SS' : 'no-SS';
+                o.textContent = t.tenant_key + ' (' + t.name + ') [' + ttBadge + '/' + ssBadge + ']';
                 tenantEl.appendChild(o);
             });
             if (!tenants.length) {
@@ -720,8 +887,74 @@ def dashboard_home() -> str:
                 o.value = '';
                 o.textContent = 'Ingen tenants';
                 tenantEl.appendChild(o);
+            } else if (current && tenants.some((t) => t.tenant_key === current)) {
+                tenantEl.value = current;
             }
             return tenants;
+        }
+
+        async function loadTenantConnections() {
+            const tenant = tenantEl.value;
+            if (!tenant) {
+                cfgStatusEl.textContent = 'Ingen tenant valgt.';
+                return;
+            }
+            try {
+                const info = await api('/api/tenants/' + encodeURIComponent(tenant) + '/connections');
+                cfgTenantKeyEl.value = info.tenant_key || tenant;
+                cfgTenantNameEl.value = info.name || '';
+                cfgTripletexBaseUrlEl.value = info.tripletex_base_url || '';
+                cfgSusoftBaseUrlEl.value = info.susoft_base_url || '';
+                cfgTripletexConsumerTokenEl.value = '';
+                cfgTripletexEmployeeTokenEl.value = '';
+                cfgSusoftShopUrlKeyEl.value = '';
+                cfgSusoftUsernameEl.value = '';
+                cfgSusoftPasswordEl.value = '';
+                const tt = info.has_tripletex_tokens ? 'TT OK' : 'TT mangler';
+                const ss = info.has_susoft_credentials ? 'Susoft OK' : 'Susoft mangler';
+                cfgStatusEl.innerHTML = statusTag(info.active ? 'ACTIVE' : 'INACTIVE') + ' ' + tt + ' / ' + ss;
+            } catch (err) {
+                cfgStatusEl.textContent = 'Kunne ikke lese tenant-tilkobling: ' + String(err);
+            }
+        }
+
+        async function saveTenantConfig() {
+            const tenantKey = String(cfgTenantKeyEl.value || '').trim();
+            const tenantName = String(cfgTenantNameEl.value || '').trim();
+            if (!tenantKey || !tenantName) {
+                logEl.textContent = 'Feil: tenant key og name er påkrevd';
+                return;
+            }
+
+            const payload = {
+                tenant_key: tenantKey,
+                name: tenantName,
+                active: true,
+                tripletex_base_url: String(cfgTripletexBaseUrlEl.value || '').trim(),
+                tripletex_consumer_token: String(cfgTripletexConsumerTokenEl.value || '').trim(),
+                tripletex_employee_token: String(cfgTripletexEmployeeTokenEl.value || '').trim(),
+                susoft_base_url: String(cfgSusoftBaseUrlEl.value || '').trim(),
+                susoft_shop_url_key: String(cfgSusoftShopUrlKeyEl.value || '').trim(),
+                susoft_username: String(cfgSusoftUsernameEl.value || '').trim(),
+                susoft_password: String(cfgSusoftPasswordEl.value || '').trim(),
+            };
+
+            try {
+                logEl.textContent = 'Lagrer tenant: ' + tenantKey;
+                const result = await api('/api/tenants', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+                logEl.textContent = JSON.stringify(result, null, 2);
+                await loadTenants();
+                tenantEl.value = tenantKey;
+                await loadTenantConnections();
+                await loadWebhooks();
+                await loadTenantData();
+            } catch (err) {
+                logEl.textContent = 'Feil ved tenant-lagring: ' + err;
+            }
         }
 
         async function loadStatus() {
@@ -738,8 +971,13 @@ def dashboard_home() -> str:
         }
 
         async function loadWebhooks() {
+            const tenant = tenantEl.value;
+            if (!tenant) {
+                webhookRowsEl.innerHTML = '<tr><td colspan="4" class="muted">Velg tenant for webhook-oppsett.</td></tr>';
+                return;
+            }
             try {
-                const response = await api('/api/tripletex/webhooks/subscriptions');
+                const response = await api('/api/tripletex/webhooks/subscriptions?tenant_key=' + encodeURIComponent(tenant));
                 latestWebhooks = Array.isArray(response.subscriptions) ? response.subscriptions : [];
                 renderWebhookRows(latestWebhooks);
                 if (!webhookTargetUrlEl.value) {
@@ -823,12 +1061,17 @@ def dashboard_home() -> str:
             stamp();
             await loadTenants();
             await loadStatus();
+            await loadTenantConnections();
             await loadWebhooks();
             await loadTenantData();
         }
 
         document.getElementById('refresh').addEventListener('click', loadAll);
-        tenantEl.addEventListener('change', loadTenantData);
+        tenantEl.addEventListener('change', async () => {
+            await loadTenantConnections();
+            await loadWebhooks();
+            await loadTenantData();
+        });
         document.getElementById('dry').addEventListener('click', () => {
             const t = tenantEl.value;
             const l = Number(limitEl.value || 50);
@@ -853,12 +1096,19 @@ def dashboard_home() -> str:
         document.getElementById('refreshWebhooks').addEventListener('click', loadWebhooks);
         document.getElementById('createOrderWebhook').addEventListener('click', () => {
             const targetUrl = String(webhookTargetUrlEl.value || '').trim();
+            const tenant = tenantEl.value;
+            if (!tenant) {
+                logEl.textContent = 'Feil: velg tenant først';
+                return;
+            }
             if (!targetUrl) {
                 logEl.textContent = 'Feil: callback URL mangler';
                 return;
             }
-            action('/api/tripletex/webhooks/subscriptions/order-create?target_url=' + encodeURIComponent(targetUrl));
+            action('/api/tripletex/webhooks/subscriptions/order-create?tenant_key=' + encodeURIComponent(tenant) + '&target_url=' + encodeURIComponent(targetUrl));
         });
+
+        document.getElementById('saveTenantConfig').addEventListener('click', saveTenantConfig);
 
         document.getElementById('eventsShortTab').addEventListener('click', () => {
             document.getElementById('eventsShortTab').classList.add('active');

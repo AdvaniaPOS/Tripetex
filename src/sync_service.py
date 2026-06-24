@@ -109,6 +109,30 @@ def _get_tenant_or_raise(session: Session, tenant_key: str) -> Tenant:
     return tenant
 
 
+def _tripletex_overrides_for_tenant(tenant: Tenant) -> dict[str, str]:
+    data: dict[str, str] = {}
+    if tenant.tripletex_base_url:
+        data["tripletex_base_url"] = tenant.tripletex_base_url
+    if tenant.tripletex_consumer_token:
+        data["tripletex_consumer_token"] = tenant.tripletex_consumer_token
+    if tenant.tripletex_employee_token:
+        data["tripletex_employee_token"] = tenant.tripletex_employee_token
+    return data
+
+
+def _susoft_overrides_for_tenant(tenant: Tenant) -> dict[str, str]:
+    data: dict[str, str] = {}
+    if tenant.susoft_base_url:
+        data["susoft_base_url"] = tenant.susoft_base_url
+    if tenant.susoft_shop_url_key:
+        data["susoft_shop_url_key"] = tenant.susoft_shop_url_key
+    if tenant.susoft_username:
+        data["susoft_username"] = tenant.susoft_username
+    if tenant.susoft_password:
+        data["susoft_password"] = tenant.susoft_password
+    return data
+
+
 def _find_order_sync_by_tripletex_order_id(session: Session, tenant_id: int, tripletex_order_id: str) -> OrderSync | None:
     return session.scalar(
         select(OrderSync).where(
@@ -136,6 +160,7 @@ def process_tripletex_order_for_tenant(
 ) -> dict[str, Any]:
     with db_session() as session:
         tenant = _get_tenant_or_raise(session, tenant_key)
+        susoft_overrides = _susoft_overrides_for_tenant(tenant)
 
         order_sync = _upsert_order_sync(session, tenant.id, order_payload)
         _add_event(
@@ -187,6 +212,7 @@ def process_tripletex_order_for_tenant(
             job_run_id=job_run_id or 0,
             order_sync=order_sync,
             order_payload=order_payload,
+            susoft_overrides=susoft_overrides,
         )
         session.commit()
         return {
@@ -210,13 +236,15 @@ def process_susoft_payment_for_tenant(
 ) -> dict[str, Any]:
     with db_session() as session:
         tenant = _get_tenant_or_raise(session, tenant_key)
+        susoft_overrides = _susoft_overrides_for_tenant(tenant)
+        tripletex_overrides = _tripletex_overrides_for_tenant(tenant)
         row = _find_order_sync_by_susoft_uuid(session, tenant.id, susoft_uuid)
         if row is None:
             raise RuntimeError(f"Fant ingen lokal ordre for Susoft UUID {susoft_uuid}")
 
-        token = susoft_authenticate()
-        order = find_order_by_uuid(susoft_uuid, token=token)
-        cart = find_cart_by_uuid(susoft_uuid, token=token)
+        token = susoft_authenticate(overrides=susoft_overrides)
+        order = find_order_by_uuid(susoft_uuid, token=token, overrides=susoft_overrides)
+        cart = find_cart_by_uuid(susoft_uuid, token=token, overrides=susoft_overrides)
 
         if order is None:
             _add_event(
@@ -292,7 +320,7 @@ def process_susoft_payment_for_tenant(
 
         try:
             today = payment_date or datetime.now(UTC).date().isoformat()
-            tt_headers = build_basic_headers(create_session_token())
+            tt_headers = build_basic_headers(create_session_token(overrides=tripletex_overrides))
             invoice_id = create_invoice(order_id=tt_order_id, invoice_date=today, headers=tt_headers, dry_run=False)
             register_payment(
                 invoice_id=invoice_id,
@@ -377,9 +405,9 @@ def process_susoft_payment_for_tenant(
             }
 
 
-def find_tripletex_order_by_id(order_id: int) -> dict[str, Any] | None:
-    token = create_session_token()
-    payload = fetch_open_orders(token)
+def find_tripletex_order_by_id(order_id: int, *, tripletex_overrides: dict[str, str] | None = None) -> dict[str, Any] | None:
+    token = create_session_token(overrides=tripletex_overrides)
+    payload = fetch_open_orders(token, overrides=tripletex_overrides)
     values = payload.get("values") if isinstance(payload, dict) else []
     orders = values if isinstance(values, list) else []
     for order in orders:
@@ -395,7 +423,10 @@ def process_tripletex_order_by_id_for_tenant(
     dry_run: bool = False,
     job_run_id: int | None = None,
 ) -> dict[str, Any]:
-    order = find_tripletex_order_by_id(order_id)
+    with db_session() as session:
+        tenant = _get_tenant_or_raise(session, tenant_key)
+        tripletex_overrides = _tripletex_overrides_for_tenant(tenant)
+    order = find_tripletex_order_by_id(order_id, tripletex_overrides=tripletex_overrides)
     if order is None:
         raise RuntimeError(f"Fant ikke Tripletex-ordre {order_id} i åpne ordrer")
     return process_tripletex_order_for_tenant(tenant_key, order, dry_run=dry_run, job_run_id=job_run_id)
@@ -409,8 +440,9 @@ def get_sendable_orders_for_tenant(tenant_key: str, *, limit: int) -> dict[str, 
         if not tenant.active:
             raise RuntimeError(f"Tenant er inaktiv: {tenant_key}")
 
-        token = create_session_token()
-        payload = fetch_open_orders(token)
+        tripletex_overrides = _tripletex_overrides_for_tenant(tenant)
+        token = create_session_token(overrides=tripletex_overrides)
+        payload = fetch_open_orders(token, overrides=tripletex_overrides)
         values = payload.get("values")
         orders = values if isinstance(values, list) else []
 
@@ -543,6 +575,7 @@ def _push_order_to_susoft(
     job_run_id: int | None,
     order_sync: OrderSync,
     order_payload: dict[str, Any],
+    susoft_overrides: dict[str, str] | None = None,
 ) -> bool:
     try:
         if order_sync.status == "PUSHED_TO_SUSOFT" and order_sync.susoft_uuid:
@@ -558,7 +591,7 @@ def _push_order_to_susoft(
             return True
 
         mapped = _build_susoft_order_payload(order_payload)
-        created = create_susoft_order(mapped)
+        created = create_susoft_order(mapped, overrides=susoft_overrides)
 
         order_sync.status = "PUSHED_TO_SUSOFT"
         order_sync.last_error = None
@@ -624,8 +657,10 @@ def run_manual_sync_for_tenant(tenant_key: str, *, dry_run: bool, limit: int) ->
         synced = 0
 
         try:
-            token = create_session_token()
-            payload = fetch_open_orders(token)
+            tripletex_overrides = _tripletex_overrides_for_tenant(tenant)
+            susoft_overrides = _susoft_overrides_for_tenant(tenant)
+            token = create_session_token(overrides=tripletex_overrides)
+            payload = fetch_open_orders(token, overrides=tripletex_overrides)
             values = payload.get("values")
             orders = values if isinstance(values, list) else []
 
@@ -698,6 +733,7 @@ def run_manual_sync_for_tenant(tenant_key: str, *, dry_run: bool, limit: int) ->
                     job_run_id=job.id,
                     order_sync=order_sync,
                     order_payload=order,
+                    susoft_overrides=susoft_overrides,
                 )
                 if ok:
                     synced += 1
@@ -760,6 +796,7 @@ def retry_failed_orders_for_tenant(tenant_key: str, *, limit: int) -> dict[str, 
         )
 
         try:
+            susoft_overrides = _susoft_overrides_for_tenant(tenant)
             rows = session.scalars(
                 select(OrderSync)
                 .where(OrderSync.tenant_id == tenant.id, OrderSync.status == "FAILED")
@@ -793,6 +830,7 @@ def retry_failed_orders_for_tenant(tenant_key: str, *, limit: int) -> dict[str, 
                     job_run_id=job.id,
                     order_sync=row,
                     order_payload=payload,
+                    susoft_overrides=susoft_overrides,
                 )
                 if ok:
                     succeeded += 1
@@ -860,8 +898,10 @@ def sync_paid_orders_to_tripletex_for_tenant(
         )
 
         try:
-            token = susoft_authenticate()
-            tt_headers = build_basic_headers(create_session_token())
+            susoft_overrides = _susoft_overrides_for_tenant(tenant)
+            tripletex_overrides = _tripletex_overrides_for_tenant(tenant)
+            token = susoft_authenticate(overrides=susoft_overrides)
+            tt_headers = build_basic_headers(create_session_token(overrides=tripletex_overrides))
 
             rows = session.scalars(
                 select(OrderSync)
@@ -883,8 +923,8 @@ def sync_paid_orders_to_tripletex_for_tenant(
                     continue
 
                 try:
-                    order = find_order_by_uuid(uuid, token=token)
-                    cart = find_cart_by_uuid(uuid, token=token)
+                    order = find_order_by_uuid(uuid, token=token, overrides=susoft_overrides)
+                    cart = find_cart_by_uuid(uuid, token=token, overrides=susoft_overrides)
                 except Exception as exc:
                     errors += 1
                     row.status = "TT_PAYMENT_FAILED"

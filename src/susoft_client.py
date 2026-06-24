@@ -7,31 +7,43 @@ import requests
 from src.config import get_settings
 
 
-def _base_headers() -> dict[str, str]:
+def _resolve_susoft_settings(overrides: dict[str, str] | None = None) -> dict[str, str]:
     settings = get_settings()
-    if not settings.susoft_shop_url_key:
+    data = overrides or {}
+    return {
+        "base_url": str(data.get("susoft_base_url") or settings.susoft_base_url),
+        "shop_url_key": str(data.get("susoft_shop_url_key") or settings.susoft_shop_url_key),
+        "username": str(data.get("susoft_username") or settings.susoft_username),
+        "password": str(data.get("susoft_password") or settings.susoft_password),
+        "timeout": str(settings.request_timeout_seconds),
+    }
+
+
+def _base_headers(*, overrides: dict[str, str] | None = None) -> dict[str, str]:
+    resolved = _resolve_susoft_settings(overrides)
+    if not resolved["shop_url_key"]:
         raise RuntimeError("Susoft shop key mangler i miljokonfigurasjon (.env).")
     return {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "X-Shop-Url-Key": settings.susoft_shop_url_key,
+        "X-Shop-Url-Key": resolved["shop_url_key"],
     }
 
 
-def _authenticate() -> str:
-    settings = get_settings()
-    if not settings.susoft_username or not settings.susoft_password:
+def _authenticate(*, overrides: dict[str, str] | None = None) -> str:
+    resolved = _resolve_susoft_settings(overrides)
+    if not resolved["username"] or not resolved["password"]:
         raise RuntimeError("Susoft brukernavn/passord mangler i miljokonfigurasjon (.env).")
 
-    url = f"{settings.susoft_base_url}/user/auth"
+    url = f"{resolved['base_url']}/user/auth"
     body = {
-        "login": settings.susoft_username,
-        "password": settings.susoft_password,
+        "login": resolved["username"],
+        "password": resolved["password"],
     }
-    headers = _base_headers()
+    headers = _base_headers(overrides=overrides)
 
     try:
-        response = requests.post(url, headers=headers, json=body, timeout=settings.request_timeout_seconds)
+        response = requests.post(url, headers=headers, json=body, timeout=int(resolved["timeout"]))
     except requests.RequestException as exc:
         raise RuntimeError(f"Nettverksfeil ved auth mot Susoft: {exc}") from exc
 
@@ -45,20 +57,20 @@ def _authenticate() -> str:
     return token
 
 
-def authenticate() -> str:
-    return _authenticate()
+def authenticate(*, overrides: dict[str, str] | None = None) -> str:
+    return _authenticate(overrides=overrides)
 
 
-def create_order(order_payload: dict[str, Any]) -> dict[str, Any]:
-    settings = get_settings()
-    token = _authenticate()
+def create_order(order_payload: dict[str, Any], *, overrides: dict[str, str] | None = None) -> dict[str, Any]:
+    resolved = _resolve_susoft_settings(overrides)
+    token = _authenticate(overrides=overrides)
     # Use shopping cart endpoint so order is not finalized by integration and can continue in POS.
-    url = f"{settings.susoft_base_url}/shopping-cart"
-    headers = _base_headers()
+    url = f"{resolved['base_url']}/shopping-cart"
+    headers = _base_headers(overrides=overrides)
     headers["Authorization"] = f"Bearer {token}"
 
     try:
-        response = requests.post(url, headers=headers, json=order_payload, timeout=settings.request_timeout_seconds)
+        response = requests.post(url, headers=headers, json=order_payload, timeout=int(resolved["timeout"]))
     except requests.RequestException as exc:
         raise RuntimeError(f"Nettverksfeil ved opprettelse av Susoft-ordre: {exc}") from exc
 
@@ -80,17 +92,22 @@ def create_order(order_payload: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-def find_cart_by_external_id(ext_id: str, token: str | None = None) -> dict[str, Any] | None:
-    settings = get_settings()
-    auth_token = token or _authenticate()
-    url = f"{settings.susoft_base_url}/shopping-cart/external-id"
+def find_cart_by_external_id(
+    ext_id: str,
+    token: str | None = None,
+    *,
+    overrides: dict[str, str] | None = None,
+) -> dict[str, Any] | None:
+    resolved = _resolve_susoft_settings(overrides)
+    auth_token = token or _authenticate(overrides=overrides)
+    url = f"{resolved['base_url']}/shopping-cart/external-id"
 
-    headers = _base_headers()
+    headers = _base_headers(overrides=overrides)
     headers["Authorization"] = f"Bearer {auth_token}"
     params = {"extId": ext_id}
 
     try:
-        response = requests.get(url, headers=headers, params=params, timeout=settings.request_timeout_seconds)
+        response = requests.get(url, headers=headers, params=params, timeout=int(resolved["timeout"]))
     except requests.RequestException as exc:
         raise RuntimeError(f"Nettverksfeil ved lesing av Susoft shopping-cart per externalRef: {exc}") from exc
 
@@ -105,17 +122,22 @@ def find_cart_by_external_id(ext_id: str, token: str | None = None) -> dict[str,
     return data
 
 
-def find_cart_by_uuid(uuid: str, token: str | None = None) -> dict[str, Any] | None:
-    settings = get_settings()
-    auth_token = token or _authenticate()
-    url = f"{settings.susoft_base_url}/shopping-cart/uuid"
+def find_cart_by_uuid(
+    uuid: str,
+    token: str | None = None,
+    *,
+    overrides: dict[str, str] | None = None,
+) -> dict[str, Any] | None:
+    resolved = _resolve_susoft_settings(overrides)
+    auth_token = token or _authenticate(overrides=overrides)
+    url = f"{resolved['base_url']}/shopping-cart/uuid"
 
-    headers = _base_headers()
+    headers = _base_headers(overrides=overrides)
     headers["Authorization"] = f"Bearer {auth_token}"
     params = {"uuid": uuid}
 
     try:
-        response = requests.get(url, headers=headers, params=params, timeout=settings.request_timeout_seconds)
+        response = requests.get(url, headers=headers, params=params, timeout=int(resolved["timeout"]))
     except requests.RequestException as exc:
         raise RuntimeError(f"Nettverksfeil ved lesing av Susoft shopping-cart per uuid: {exc}") from exc
 
@@ -130,17 +152,22 @@ def find_cart_by_uuid(uuid: str, token: str | None = None) -> dict[str, Any] | N
     return data
 
 
-def find_order_by_uuid(uuid: str, token: str | None = None) -> dict[str, Any] | None:
-    settings = get_settings()
-    auth_token = token or _authenticate()
-    url = f"{settings.susoft_base_url}/order/uuid"
+def find_order_by_uuid(
+    uuid: str,
+    token: str | None = None,
+    *,
+    overrides: dict[str, str] | None = None,
+) -> dict[str, Any] | None:
+    resolved = _resolve_susoft_settings(overrides)
+    auth_token = token or _authenticate(overrides=overrides)
+    url = f"{resolved['base_url']}/order/uuid"
 
-    headers = _base_headers()
+    headers = _base_headers(overrides=overrides)
     headers["Authorization"] = f"Bearer {auth_token}"
     params = {"uuid": uuid}
 
     try:
-        response = requests.get(url, headers=headers, params=params, timeout=settings.request_timeout_seconds)
+        response = requests.get(url, headers=headers, params=params, timeout=int(resolved["timeout"]))
     except requests.RequestException as exc:
         raise RuntimeError(f"Nettverksfeil ved lesing av Susoft order per uuid: {exc}") from exc
 

@@ -17,6 +17,13 @@ class Tenant(Base):
     tenant_key: Mapped[str] = mapped_column(String(100), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(255))
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    tripletex_base_url: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    tripletex_consumer_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tripletex_employee_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    susoft_base_url: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    susoft_shop_url_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    susoft_username: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    susoft_password: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
 

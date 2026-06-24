@@ -13,6 +13,17 @@ from src.config import get_settings
 TIMEOUT_SECONDS = 30
 
 
+def _resolve_tripletex_settings(overrides: dict[str, str] | None = None) -> dict[str, str]:
+    settings = get_settings()
+    data = overrides or {}
+    return {
+        "base_url": str(data.get("tripletex_base_url") or settings.tripletex_base_url),
+        "consumer_token": str(data.get("tripletex_consumer_token") or settings.tripletex_consumer_token),
+        "employee_token": str(data.get("tripletex_employee_token") or settings.tripletex_employee_token),
+        "timezone": str(data.get("tripletex_timezone") or settings.tripletex_timezone),
+    }
+
+
 def _auth_headers(session_token: str) -> dict[str, str]:
     basic_credentials = base64.b64encode(f"0:{session_token}".encode("utf-8")).decode("ascii")
     return {
@@ -37,9 +48,10 @@ def build_fields() -> str:
     )
 
 
-def build_order_params() -> dict[str, str]:
+def build_order_params(*, tripletex_timezone: str | None = None) -> dict[str, str]:
     settings = get_settings()
-    today_oslo = datetime.now(ZoneInfo(settings.tripletex_timezone)).date()
+    tz_name = tripletex_timezone or settings.tripletex_timezone
+    today_oslo = datetime.now(ZoneInfo(tz_name)).date()
     order_date_from = (today_oslo - timedelta(days=365)).isoformat()
     order_date_to = (today_oslo + timedelta(days=1)).isoformat()
     return {
@@ -51,17 +63,17 @@ def build_order_params() -> dict[str, str]:
     }
 
 
-def create_session_token() -> str:
-    settings = get_settings()
-    if not settings.tripletex_consumer_token or not settings.tripletex_employee_token:
+def create_session_token(*, overrides: dict[str, str] | None = None) -> str:
+    resolved = _resolve_tripletex_settings(overrides)
+    if not resolved["consumer_token"] or not resolved["employee_token"]:
         raise RuntimeError("Tripletex tokens mangler i miljokonfigurasjon (.env).")
 
-    expiration_date = (datetime.now(ZoneInfo(settings.tripletex_timezone)).date() + timedelta(days=1)).isoformat()
+    expiration_date = (datetime.now(ZoneInfo(resolved["timezone"])).date() + timedelta(days=1)).isoformat()
 
-    url = f"{settings.tripletex_base_url}/token/session/:create"
+    url = f"{resolved['base_url']}/token/session/:create"
     params = {
-        "consumerToken": settings.tripletex_consumer_token,
-        "employeeToken": settings.tripletex_employee_token,
+        "consumerToken": resolved["consumer_token"],
+        "employeeToken": resolved["employee_token"],
         "expirationDate": expiration_date,
     }
 
@@ -82,10 +94,10 @@ def create_session_token() -> str:
     raise RuntimeError("Tripletex session token finnes ikke i respons.")
 
 
-def fetch_open_orders(session_token: str) -> dict[str, Any]:
-    settings = get_settings()
-    url = f"{settings.tripletex_base_url}/order"
-    params = build_order_params()
+def fetch_open_orders(session_token: str, *, overrides: dict[str, str] | None = None) -> dict[str, Any]:
+    resolved = _resolve_tripletex_settings(overrides)
+    url = f"{resolved['base_url']}/order"
+    params = build_order_params(tripletex_timezone=resolved["timezone"])
 
     bearer_headers = {"Authorization": f"Bearer {session_token}", "Accept": "application/json"}
     basic_headers = {"Authorization": _auth_headers(session_token)["Authorization"], "Accept": "application/json"}
@@ -110,9 +122,9 @@ def fetch_open_orders(session_token: str) -> dict[str, Any]:
     return payload
 
 
-def list_event_subscriptions(session_token: str) -> list[dict[str, Any]]:
-    settings = get_settings()
-    url = f"{settings.tripletex_base_url}/event/subscription"
+def list_event_subscriptions(session_token: str, *, overrides: dict[str, str] | None = None) -> list[dict[str, Any]]:
+    resolved = _resolve_tripletex_settings(overrides)
+    url = f"{resolved['base_url']}/event/subscription"
     headers = _auth_headers(session_token)
 
     try:
@@ -133,12 +145,13 @@ def create_event_subscription(
     *,
     event: str,
     target_url: str,
+    overrides: dict[str, str] | None = None,
     fields: str | None = None,
     auth_header_name: str | None = None,
     auth_header_value: str | None = None,
 ) -> dict[str, Any]:
-    settings = get_settings()
-    url = f"{settings.tripletex_base_url}/event/subscription"
+    resolved = _resolve_tripletex_settings(overrides)
+    url = f"{resolved['base_url']}/event/subscription"
     headers = _auth_headers(session_token)
 
     body: dict[str, Any] = {
