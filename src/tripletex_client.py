@@ -35,7 +35,7 @@ def _auth_headers(session_token: str) -> dict[str, str]:
 
 def build_fields() -> str:
     return (
-        "id,number,orderDate,customer(id,name),"
+        "id,number,orderDate,isClosed,isSubscription,customer(id,name),"
         "orderLines("
         "id,description,count,"
         "product(id,number,name),"
@@ -55,8 +55,10 @@ def build_order_params(*, tripletex_timezone: str | None = None) -> dict[str, st
     order_date_from = (today_oslo - timedelta(days=365)).isoformat()
     order_date_to = (today_oslo + timedelta(days=1)).isoformat()
     return {
-        "isSent": "true",
-        "isInvoiced": "false",
+        # Tripletex /order supports isClosed/isSubscription filtering.
+        # We only fetch open, non-subscription orders for Susoft sync.
+        "isClosed": "false",
+        "isSubscription": "false",
         "orderDateFrom": order_date_from,
         "orderDateTo": order_date_to,
         "fields": build_fields(),

@@ -96,6 +96,20 @@ def _safe_float(value: Any) -> float:
         return 0.0
 
 
+def _is_tripletex_order_open(order_payload: dict[str, Any]) -> bool:
+    value = order_payload.get("isClosed")
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes"}:
+            return False
+        if normalized in {"false", "0", "no"}:
+            return True
+    # Backward compatibility: if the field is absent, keep prior behavior.
+    return True
+
+
 def _is_locally_handled(order_sync: OrderSync) -> bool:
     return order_sync.status in {"PUSHED_TO_SUSOFT", "TT_PAID", "TT_INVOICE_EXISTS"} and bool(order_sync.susoft_uuid)
 
@@ -158,6 +172,9 @@ def process_tripletex_order_for_tenant(
     dry_run: bool = False,
     job_run_id: int | None = None,
 ) -> dict[str, Any]:
+    if not _is_tripletex_order_open(order_payload):
+        raise RuntimeError("Tripletex-ordre er lukket og skal ikke pushes til Susoft")
+
     with db_session() as session:
         tenant = _get_tenant_or_raise(session, tenant_key)
         susoft_overrides = _susoft_overrides_for_tenant(tenant)
@@ -429,6 +446,8 @@ def process_tripletex_order_by_id_for_tenant(
     order = find_tripletex_order_by_id(order_id, tripletex_overrides=tripletex_overrides)
     if order is None:
         raise RuntimeError(f"Fant ikke Tripletex-ordre {order_id} i åpne ordrer")
+    if not _is_tripletex_order_open(order):
+        raise RuntimeError(f"Tripletex-ordre {order_id} er lukket og kan ikke sendes til Susoft")
     return process_tripletex_order_for_tenant(tenant_key, order, dry_run=dry_run, job_run_id=job_run_id)
 
 
@@ -452,6 +471,9 @@ def get_sendable_orders_for_tenant(tenant_key: str, *, limit: int) -> dict[str, 
 
         for order in orders[:limit]:
             if not isinstance(order, dict):
+                continue
+
+            if not _is_tripletex_order_open(order):
                 continue
 
             tripletex_order_id = str(order.get("id", "")).strip()
@@ -685,6 +707,18 @@ def run_manual_sync_for_tenant(tenant_key: str, *, dry_run: bool, limit: int) ->
                         event_type="ORDER_PARSE_ERROR",
                         level="ERROR",
                         message="Ugyldig ordreobjekt i Tripletex-respons",
+                    )
+                    continue
+
+                if not _is_tripletex_order_open(order):
+                    _add_event(
+                        session,
+                        tenant_id=tenant.id,
+                        job_run_id=job.id,
+                        event_type="ORDER_SKIPPED_CLOSED",
+                        level="INFO",
+                        message="Ordre er lukket i Tripletex og hoppes over",
+                        details={"tripletex_order_id": str(order.get("id", ""))},
                     )
                     continue
 
